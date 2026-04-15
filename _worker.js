@@ -17,6 +17,17 @@ export default {
       return this.fetchWebsite(targetUrl);
     }
     
+    if (url.pathname === '/proxy' && request.method === 'POST') {
+      const formData = await request.formData();
+      const resourceUrl = formData.get('url');
+      
+      if (!resourceUrl) {
+        return new Response('请输入资源地址', { status: 400 });
+      }
+      
+      return this.proxyResource(resourceUrl);
+    }
+    
     return new Response('未找到', { status: 404 });
   },
   
@@ -28,6 +39,7 @@ export default {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>ZQ-HtmlCode - 网站源代码获取器</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg t='1776166203734' class='icon' viewBox='0 0 1024 1024' version='1.1' xmlns='http://www.w3.org/2000/svg' p-id='6362'%3E%3Cpath d='M0 0h1024v1024H0z' fill='%23D8D8D8' fill-opacity='0' p-id='6363'%3E%3C/path%3E%3Cpath d='M51.2 56.889h921.6c28.274 0 51.2 22.642 51.2 50.574V916.48c0 27.932-22.926 50.574-51.2 50.574H51.2A50.859 50.859 0 0 1 0 916.48V107.52c0-27.99 22.926-50.631 51.2-50.631z m51.2 101.148v707.926h819.2V158.037H102.4z' fill='%231296db' p-id='6364'%3E%3C/path%3E%3Cpath d='M645.29 284.444L477.07 739.556h-98.418L546.93 284.444h98.418z m73.046 66.617L881.778 512 718.336 672.939l-65.365-64.399L751.047 512l-98.076-96.54 65.365-64.399z m-412.672 0l65.365 64.455L272.953 512l98.076 96.54-65.365 64.399L142.222 512l163.442-160.939z' fill='%23298DF8' p-id='6365'%3E%3C/path%3E%3C/svg%3E" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
@@ -252,6 +264,56 @@ export default {
       margin-bottom: 16px;
       font-size: 14px;
     }
+    .progress-container {
+      background: #e2e8f0;
+      border-radius: 12px;
+      padding: 16px;
+      margin-bottom: 16px;
+    }
+    .progress-bar {
+      width: 100%;
+      height: 20px;
+      background: #e2e8f0;
+      border-radius: 10px;
+      overflow: hidden;
+      margin-bottom: 12px;
+    }
+    .progress-fill {
+      height: 100%;
+      background: linear-gradient(90deg, #1296db 0%, #298DF8 100%);
+      transition: width 0.3s ease;
+    }
+    .progress-text {
+      font-size: 14px;
+      color: #475569;
+    }
+    .resource-list {
+      max-height: 300px;
+      overflow-y: auto;
+      background: #f1f5f9;
+      border-radius: 12px;
+      padding: 12px;
+    }
+    .resource-item {
+      display: flex;
+      align-items: center;
+      padding: 8px 12px;
+      margin-bottom: 4px;
+      background: white;
+      border-radius: 8px;
+      font-size: 13px;
+      word-break: break-all;
+    }
+    .resource-item.success {
+      border-left: 4px solid #10b981;
+    }
+    .resource-item.error {
+      border-left: 4px solid #dc2626;
+    }
+    .resource-icon {
+      margin-right: 10px;
+      font-size: 16px;
+    }
     
     /* 响应式设计 */
     @media (min-width: 768px) {
@@ -339,8 +401,18 @@ export default {
           <h2 id="resultTitle">源代码</h2>
           <div class="actions">
             <button type="button" id="copyBtn" style="background: linear-gradient(135deg, #10b981 0%, #059669 100%);">📋 复制</button>
-            <button type="button" id="downloadBtn" style="background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);">💾 下载</button>
+            <button type="button" id="downloadHtmlBtn" style="background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);">💾 下载HTML</button>
+            <button type="button" id="downloadAllBtn" style="background: linear-gradient(135deg, #8b5cf6 0%, #7c3aed 100%);">📦 下载全部资源</button>
           </div>
+        </div>
+        <div id="progressSection" style="display: none;">
+          <div class="progress-container">
+            <div class="progress-bar">
+              <div class="progress-fill" id="progressFill" style="width: 0%"></div>
+            </div>
+            <div class="progress-text" id="progressText">准备下载...</div>
+          </div>
+          <div class="resource-list" id="resourceList"></div>
         </div>
         <pre id="codeDisplay"></pre>
       </div>
@@ -371,7 +443,6 @@ export default {
   </div>
 
   <script>
-    // 标签页切换
     const tabs = document.querySelectorAll('.tab');
     const tabContents = document.querySelectorAll('.tab-content');
     
@@ -387,7 +458,6 @@ export default {
       });
     });
     
-    // 获取源码功能
     const form = document.getElementById('fetchForm');
     const urlInput = document.getElementById('urlInput');
     const submitBtn = document.getElementById('submitBtn');
@@ -395,10 +465,16 @@ export default {
     const resultTitle = document.getElementById('resultTitle');
     const codeDisplay = document.getElementById('codeDisplay');
     const copyBtn = document.getElementById('copyBtn');
-    const downloadBtn = document.getElementById('downloadBtn');
+    const downloadHtmlBtn = document.getElementById('downloadHtmlBtn');
+    const downloadAllBtn = document.getElementById('downloadAllBtn');
+    const progressSection = document.getElementById('progressSection');
+    const progressFill = document.getElementById('progressFill');
+    const progressText = document.getElementById('progressText');
+    const resourceList = document.getElementById('resourceList');
     
     let currentCode = '';
     let currentUrl = '';
+    let currentResources = [];
     
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
@@ -413,6 +489,7 @@ export default {
       resultSection.style.display = 'block';
       resultTitle.textContent = '正在获取...';
       codeDisplay.innerHTML = '<div class="loading"><div class="spinner"></div>请稍候...</div>';
+      progressSection.style.display = 'none';
       
       try {
         const formData = new FormData();
@@ -428,21 +505,25 @@ export default {
         if (result.success) {
           currentCode = result.code;
           currentUrl = targetUrl;
-          resultTitle.textContent = '网站源码' ;
+          currentResources = result.resources || [];
+          resultTitle.textContent = '网站源码 (' + currentResources.length + ' 个资源)';
           codeDisplay.textContent = currentCode;
           copyBtn.style.display = 'inline-block';
-          downloadBtn.style.display = 'inline-block';
+          downloadHtmlBtn.style.display = 'inline-block';
+          downloadAllBtn.style.display = 'inline-block';
         } else {
           resultTitle.textContent = '获取失败';
           codeDisplay.innerHTML = '<div class="error">' + result.error + '</div>';
           copyBtn.style.display = 'none';
-          downloadBtn.style.display = 'none';
+          downloadHtmlBtn.style.display = 'none';
+          downloadAllBtn.style.display = 'none';
         }
       } catch (err) {
         resultTitle.textContent = '错误';
         codeDisplay.innerHTML = '<div class="error">请求失败: ' + err.message + '</div>';
         copyBtn.style.display = 'none';
-        downloadBtn.style.display = 'none';
+        downloadHtmlBtn.style.display = 'none';
+        downloadAllBtn.style.display = 'none';
       } finally {
         submitBtn.disabled = false;
         submitBtn.textContent = '获取源代码';
@@ -461,7 +542,7 @@ export default {
       }
     });
     
-    downloadBtn.addEventListener('click', () => {
+    downloadHtmlBtn.addEventListener('click', () => {
       const blob = new Blob([currentCode], { type: 'text/html' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
@@ -474,7 +555,80 @@ export default {
       URL.revokeObjectURL(url);
     });
     
-    // HTML 压缩解压功能
+    downloadAllBtn.addEventListener('click', async () => {
+      if (!currentResources.length) {
+        alert('没有可下载的资源');
+        return;
+      }
+      
+      progressSection.style.display = 'block';
+      progressFill.style.width = '0%';
+      progressText.textContent = '准备下载资源...';
+      resourceList.innerHTML = '';
+      downloadAllBtn.disabled = true;
+      
+      const zip = new JSZip();
+      const hostname = new URL(currentUrl).hostname;
+      
+      zip.file('index.html', currentCode);
+      
+      let downloaded = 0;
+      const total = currentResources.length;
+      
+      for (const resource of currentResources) {
+        const listItem = document.createElement('div');
+        listItem.className = 'resource-item';
+        listItem.innerHTML = '<span class="resource-icon">⏳</span><span>' + resource.url.substring(0, 60) + (resource.url.length > 60 ? '...' : '') + '</span>';
+        resourceList.appendChild(listItem);
+        resourceList.scrollTop = resourceList.scrollHeight;
+        
+        try {
+          const formData = new FormData();
+          formData.append('url', resource.url);
+          
+          const response = await fetch('/proxy', {
+            method: 'POST',
+            body: formData
+          });
+          
+          if (response.ok) {
+            const blob = await response.blob();
+            zip.file(resource.path, blob);
+            
+            listItem.className = 'resource-item success';
+            listItem.innerHTML = '<span class="resource-icon">✅</span><span>' + resource.url.substring(0, 60) + (resource.url.length > 60 ? '...' : '') + '</span>';
+          } else {
+            listItem.className = 'resource-item error';
+            listItem.innerHTML = '<span class="resource-icon">❌</span><span>' + resource.url.substring(0, 60) + (resource.url.length > 60 ? '...' : '') + '</span>';
+          }
+        } catch (err) {
+          listItem.className = 'resource-item error';
+          listItem.innerHTML = '<span class="resource-icon">❌</span><span>' + resource.url.substring(0, 60) + (resource.url.length > 60 ? '...' : '') + '</span>';
+        }
+        
+        downloaded++;
+        const progress = Math.round((downloaded / total) * 100);
+        progressFill.style.width = progress + '%';
+        progressText.textContent = '下载中: ' + downloaded + '/' + total + ' (' + progress + '%)';
+      }
+      
+      progressText.textContent = '正在生成 ZIP 文件...';
+      
+      zip.generateAsync({ type: 'blob' }).then(function(content) {
+        const url = URL.createObjectURL(content);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = hostname + '_complete.zip';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        
+        progressText.textContent = '下载完成！';
+        downloadAllBtn.disabled = false;
+      });
+    });
+    
     const htmlInput = document.getElementById('htmlInput');
     const compressBtn = document.getElementById('compressBtn');
     const decompressBtn = document.getElementById('decompressBtn');
@@ -487,65 +641,44 @@ export default {
     
     let currentCompressCode = '';
     
-    // HTML 压缩函数
     function compressHTML(html) {
       let result = html;
       
-      // 移除 HTML 注释
       result = result.replace(/<!--[\\s\\S]*?-->/g, '');
-      
-      // 移除多余的空白字符
       result = result.replace(/\\s+/g, ' ');
-      
-      // 移除标签之间的空白
       result = result.replace(/>\\s+</g, '><');
-      
-      // 移除属性周围的多余空格
       result = result.replace(/\\s*=\\s*/g, '=');
-      
-      // 移除首尾空白
       result = result.trim();
       
       return result;
     }
     
-    // HTML 格式化/解压函数
     function decompressHTML(html) {
       let result = html;
       let indent = 0;
       const indentSize = 2;
       
-      // 先移除多余空白
       result = result.replace(/\\s+/g, ' ');
       result = result.replace(/>\\s+</g, '>\\n<');
       
       const lines = result.split('\\n');
       const formattedLines = [];
       
-      const voidElements = ['area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 
-                            'link', 'meta', 'param', 'source', 'track', 'wbr', '!doctype'];
+      const voidElements = ['area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'param', 'source', 'track', 'wbr', '!doctype'];
       
       for (let line of lines) {
         line = line.trim();
         if (!line) continue;
         
-        // 检查是否是结束标签
         const isCloseTag = /^<\\//.test(line);
+        const isSelfClosing = /\\/>$/.test(line) || voidElements.some(el => new RegExp('^<' + el, 'i').test(line));
         
-        // 检查是否是自闭合标签或空元素
-        const isSelfClosing = /\\/>$/.test(line) || voidElements.some(el => 
-          new RegExp('^<' + el, 'i').test(line)
-        );
-        
-        // 如果是结束标签，减少缩进
         if (isCloseTag) {
           indent = Math.max(0, indent - 1);
         }
         
-        // 添加缩进
         formattedLines.push(' '.repeat(indent * indentSize) + line);
         
-        // 如果是开始标签且不是自闭合，增加缩进
         if (!isCloseTag && !isSelfClosing && /^<[^\\/!][^>]*[^\\/]>$/.test(line)) {
           const tagName = line.match(/^<([a-zA-Z0-9-]+)/);
           if (tagName && !voidElements.includes(tagName[1].toLowerCase())) {
@@ -630,11 +763,13 @@ export default {
       });
       
       const code = await response.text();
+      const resources = this.extractResources(code, targetUrl);
       
       return new Response(JSON.stringify({
         success: true,
         code: code,
-        url: targetUrl
+        url: targetUrl,
+        resources: resources
       }), {
         headers: { 'Content-Type': 'application/json; charset=utf-8' }
       });
@@ -645,6 +780,189 @@ export default {
       }), {
         headers: { 'Content-Type': 'application/json; charset=utf-8' }
       });
+    }
+  },
+  
+  extractResources(html, baseUrl) {
+    const resources = [];
+    const baseUrlObj = new URL(baseUrl);
+    
+    const resourceTypes = [
+      { pattern: /<link[^>]+href=["']([^"']+)["']/gi, type: 'css' },
+      { pattern: /<script[^>]+src=["']([^"']+)["']/gi, type: 'js' },
+      { pattern: /<img[^>]+src=["']([^"']+)["']/gi, type: 'image' },
+      { pattern: /<img[^>]+srcset=["']([^"']+)["']/gi, type: 'image-srcset', multi: true },
+      { pattern: /<img[^>]+data-src=["']([^"']+)["']/gi, type: 'image-lazy' },
+      { pattern: /<img[^>]+data-lazy=["']([^"']+)["']/gi, type: 'image-lazy' },
+      { pattern: /<source[^>]+src=["']([^"']+)["']/gi, type: 'media' },
+      { pattern: /<source[^>]+srcset=["']([^"']+)["']/gi, type: 'media-srcset', multi: true },
+      { pattern: /<video[^>]+src=["']([^"']+)["']/gi, type: 'media' },
+      { pattern: /<video[^>]+poster=["']([^"']+)["']/gi, type: 'poster' },
+      { pattern: /<audio[^>]+src=["']([^"']+)["']/gi, type: 'media' },
+      { pattern: /<iframe[^>]+src=["']([^"']+)["']/gi, type: 'iframe' },
+      { pattern: /<embed[^>]+src=["']([^"']+)["']/gi, type: 'embed' },
+      { pattern: /<object[^>]+data=["']([^"']+)["']/gi, type: 'object' },
+      { pattern: /<track[^>]+src=["']([^"']+)["']/gi, type: 'track' },
+      { pattern: /<input[^>]+src=["']([^"']+)["']/gi, type: 'input-image' },
+      { pattern: /<area[^>]+href=["']([^"']+)["']/gi, type: 'area' },
+      { pattern: /<meta[^>]+content=["']([^"']+\.(png|jpg|jpeg|gif|webp|svg|ico))["']/gi, type: 'meta-image' },
+      { pattern: /url\(["']?([^"')]+\.(png|jpg|jpeg|gif|webp|svg|ico|woff|woff2|ttf|eot))["']?\)/gi, type: 'css-resource' },
+      { pattern: /url\(["']?([^"')]+)["']?\)/gi, type: 'css-url' }
+    ];
+    
+    const seenUrls = new Set();
+    
+    for (const { pattern, type, multi } of resourceTypes) {
+      let match;
+      const patternCopy = new RegExp(pattern.source, pattern.flags);
+      while ((match = patternCopy.exec(html)) !== null) {
+        let urlsToProcess = [match[1]];
+        
+        if (multi) {
+          urlsToProcess = this.parseSrcset(match[1]);
+        }
+        
+        for (const originalUrl of urlsToProcess) {
+          const cleanedUrl = this.cleanUrl(originalUrl);
+          
+          if (!this.isValidResourceUrl(cleanedUrl)) continue;
+          
+          try {
+            const fullUrl = new URL(cleanedUrl, baseUrl).href;
+            
+            if (seenUrls.has(fullUrl)) continue;
+            seenUrls.add(fullUrl);
+            
+            if (!this.isValidExtension(fullUrl)) continue;
+            
+            const path = this.getResourcePath(fullUrl, baseUrlObj, cleanedUrl);
+            
+            resources.push({
+              url: fullUrl,
+              originalUrl: cleanedUrl,
+              type: type,
+              path: path,
+              valid: true
+            });
+          } catch (e) {
+            continue;
+          }
+        }
+      }
+    }
+    
+    return resources;
+  },
+  
+  cleanUrl(url) {
+    return url.trim().split(/[?#]/)[0];
+  },
+  
+  isValidResourceUrl(url) {
+    if (!url) return false;
+    if (url.startsWith('data:')) return false;
+    if (url.startsWith('#')) return false;
+    if (url.startsWith('javascript:')) return false;
+    if (url.startsWith('mailto:')) return false;
+    if (url.startsWith('tel:')) return false;
+    if (url.startsWith('about:')) return false;
+    if (url.startsWith('blob:')) return false;
+    return true;
+  },
+  
+  isValidExtension(url) {
+    try {
+      const urlObj = new URL(url);
+      const pathname = urlObj.pathname.toLowerCase();
+      
+      const invalidExtensions = ['.html', '.htm', '.php', '.asp', '.jsp', '.json', '.xml'];
+      for (const ext of invalidExtensions) {
+        if (pathname.endsWith(ext)) return false;
+      }
+      
+      const validExtensions = ['.css', '.js', '.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.ico', 
+                              '.woff', '.woff2', '.ttf', '.eot', '.otf', '.mp4', '.webm', '.mp3', '.wav',
+                              '.pdf', '.txt', '.csv'];
+      for (const ext of validExtensions) {
+        if (pathname.endsWith(ext)) return true;
+      }
+      
+      if (pathname.includes('.') && pathname.length > 4) return true;
+      
+      return false;
+    } catch (e) {
+      return false;
+    }
+  },
+  
+  parseSrcset(srcset) {
+    const urls = [];
+    const parts = srcset.split(',');
+    
+    for (const part of parts) {
+      const trimmed = part.trim();
+      if (!trimmed) continue;
+      
+      const urlPart = trimmed.split(/\s+/)[0];
+      if (urlPart) {
+        urls.push(urlPart);
+      }
+    }
+    
+    return urls;
+  },
+  
+  getResourcePath(url, baseUrlObj, originalUrl) {
+    try {
+      if (!originalUrl.startsWith('http://') && !originalUrl.startsWith('https://')) {
+        let pathname = originalUrl;
+        if (pathname.startsWith('/')) {
+          pathname = pathname.substring(1);
+        }
+        if (pathname && !pathname.includes('?') && !pathname.includes('#')) {
+          return pathname.replace(/[<>:\"|?*]/g, '_');
+        }
+      }
+      
+      const urlObj = new URL(url);
+      let pathname = urlObj.pathname;
+      if (pathname === '/') {
+        pathname = '/index';
+      }
+      
+      if (pathname.startsWith('/')) {
+        pathname = pathname.substring(1);
+      }
+      
+      if (!pathname.includes('.')) {
+        pathname += '.html';
+      }
+      
+      return pathname.replace(/[<>:\"|?*]/g, '_');
+    } catch (e) {
+      return 'resource_' + Math.random().toString(36).substr(2, 9);
+    }
+  },
+  
+  async proxyResource(resourceUrl) {
+    try {
+      const response = await fetch(resourceUrl, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        }
+      });
+      
+      const contentType = response.headers.get('content-type') || 'application/octet-stream';
+      const body = await response.arrayBuffer();
+      
+      return new Response(body, {
+        headers: {
+          'Content-Type': contentType,
+          'Access-Control-Allow-Origin': '*'
+        }
+      });
+    } catch (err) {
+      return new Response('Failed to fetch resource', { status: 500 });
     }
   }
 };
