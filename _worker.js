@@ -132,6 +132,7 @@ function getLoginHTML(PASSWORD) {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>ZQ-HtmlIco | 登录</title>
+    <link rel="icon" href="https://img.520jacky.dpdns.org/i/2026/04/14/937761.webp" type="image/webp">
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
         body {
@@ -842,6 +843,7 @@ function getFrontendHTML(PASSWORD) {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
     <title>ZQ-HtmlIco</title>
+    <link rel="icon" href="https://img.520jacky.dpdns.org/i/2026/04/14/937761.webp" type="image/webp">
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
     <style>
