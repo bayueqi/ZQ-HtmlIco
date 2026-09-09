@@ -132,7 +132,7 @@ function getLoginHTML(PASSWORD) {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>ZQ-HtmlIco | 登录</title>
-    <link rel="icon" href="https://img.520jacky.dpdns.org/i/2026/04/14/937761.webp" type="image/webp">
+    <link rel="icon" href="https://img.520jacky.dpdns.org/i/2026/03/23/849814.svg" type="image/webp">
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
         body {
