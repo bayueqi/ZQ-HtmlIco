@@ -1002,6 +1002,12 @@ function getFrontendHTML(PASSWORD) {
                     </div>
                     <div id="viewStatus" class="mt-2 text-sm text-green-600 hidden">正在下载图标...</div>
                 </div>
+                <div class="simple-api-section">
+                    <div class="flex flex-col sm:flex-row gap-2">
+                        <input type="text" id="simpleApiUrl" class="flex-1 px-4 py-2 border rounded-lg bg-gray-50 text-sm font-mono" readonly>
+                        <button type="button" id="copyApiBtn" class="bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded-lg whitespace-nowrap">📋 复制链接</button>
+                    </div>
+                </div>
             </div>
         </div>
 
@@ -1217,6 +1223,26 @@ function displayResults(data) {
             }).catch((err) => console.error('复制失败:', err));
         });
     });
+
+    const hostname = new URL(data.url).hostname;
+    const simpleApiUrl = window.location.origin + '/' + PASSWORD + '/' + hostname;
+    const simpleApiInput = document.getElementById('simpleApiUrl');
+    simpleApiInput.value = simpleApiUrl;
+
+    document.getElementById('copyApiBtn').onclick = async () => {
+        try {
+            await navigator.clipboard.writeText(simpleApiUrl);
+            const btn = document.getElementById('copyApiBtn');
+            btn.textContent = '✅ 已复制';
+            setTimeout(() => btn.textContent = '📋 复制链接', 2000);
+        } catch (err) {
+            simpleApiInput.select();
+            document.execCommand('copy');
+            const btn = document.getElementById('copyApiBtn');
+            btn.textContent = '✅ 已复制';
+            setTimeout(() => btn.textContent = '📋 复制链接', 2000);
+        }
+    };
 
     resultsContainer.classList.remove('hidden');
 }
