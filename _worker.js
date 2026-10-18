@@ -1,5 +1,6 @@
 // 配置
 const DEFAULT_PASSWORD = 'zq-htmlico';
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
 function getPasswordAttribute(password) {
   return `data-password="${password}"`;
@@ -132,7 +133,7 @@ function getLoginHTML(PASSWORD) {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>ZQ-HtmlIco | 登录</title>
-    <link rel="icon" href="http://img.520jk.cc.cd/i/2026/10/10/957246.svg" type="image/webp">
+    <link rel="icon" href="https://img.520jk.cc.cd/i/2026/10/18/724161.png" type="image/png">
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
         body {
@@ -221,357 +222,154 @@ async function handleFaviconRequest(request, isLoggedIn) {
   try {
     const body = await request.json();
     let targetUrl = body.url;
-
-    console.log('Received favicon request for:', targetUrl);
-
     if (!targetUrl) {
-      console.log('Error: URL is required');
-      return new Response(JSON.stringify({ error: 'URL is required' }), {
-        status: 400,
-        headers: { 'Content-Type': 'application/json' },
-      });
+      return jsonResponse({ error: 'URL is required' }, 400);
     }
-
     if (!targetUrl.startsWith('http://') && !targetUrl.startsWith('https://')) {
       targetUrl = 'https://' + targetUrl;
-      console.log('Added https protocol:', targetUrl);
     }
 
-    const fullUrl = new URL(targetUrl);
-    const domain = fullUrl.origin;
-    console.log('Processing domain:', domain);
+    const domain = new URL(targetUrl).origin;
+    const found = await findFavicon(domain);
 
-    const websiteInfo = await fetchWebsiteInfo(domain);
-
-    let faviconCandidates = [];
-    try {
-      console.log('Fetching HTML from:', domain);
-      const htmlResponse = await fetch(domain, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        }
-      });
-      if (htmlResponse.ok) {
-        console.log('HTML fetched successfully');
-        const html = await htmlResponse.text();
-        faviconCandidates = extractAllFaviconsFromHTML(html, domain);
-        console.log('Extracted favicon candidates from HTML:', faviconCandidates);
-
-        if (!websiteInfo.title) {
-          websiteInfo.title = extractTitleFromHTML(html);
-        }
-        if (!websiteInfo.description) {
-          websiteInfo.description = extractDescriptionFromHTML(html);
-        }
-      } else {
-        console.log('HTML fetch failed with status:', htmlResponse.status);
-      }
-    } catch (e) {
-      console.log('Error fetching HTML:', e.message);
-    }
-
-    const commonPaths = [
-      '/favicon.ico',
-      '/apple-touch-icon.png',
-      '/apple-touch-icon-precomposed.png',
-      '/favicon.png',
-      '/favicon.svg',
-      '/static/favicon.ico',
-      '/static/favicon.png',
-      '/assets/favicon.ico',
-      '/assets/favicon.png',
-      '/img/favicon.ico',
-      '/img/favicon.png',
-      '/favicon-32x32.png',
-      '/favicon-16x16.png',
-      '/android-chrome-192x192.png',
-      '/android-chrome-512x512.png'
-    ];
-
-    for (const path of commonPaths) {
-      faviconCandidates.push(domain + path);
-    }
-    console.log('Added common favicon paths, total candidates:', faviconCandidates.length);
-
-    faviconCandidates = [...new Set(faviconCandidates)];
-    console.log('After deduplication, total candidates:', faviconCandidates.length);
-    console.log('Final candidate list:', faviconCandidates);
-
-    let faviconUrl = null;
-    let faviconData = null;
-
-    for (const candidate of faviconCandidates) {
-      try {
-        console.log('Trying favicon URL:', candidate);
-        const response = await fetch(candidate, {
-          method: 'GET',
-          redirect: 'follow',
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-          }
-        });
-        if (response.ok) {
-          console.log('Favicon found at:', candidate, 'status:', response.status);
-          const contentType = response.headers.get('Content-Type');
-          console.log('Content-Type:', contentType);
-          if (contentType && (contentType.includes('image/') || contentType.includes('application/x-icon'))) {
-            if (contentType.includes('image/svg+xml')) {
-              console.log('SVG favicon found, skipping:', candidate);
-              continue;
-            }
-            console.log('Valid favicon found:', candidate);
-            faviconUrl = candidate;
-            faviconData = await response.arrayBuffer();
-            break;
-          } else {
-            console.log('Not an image content type, skipping:', contentType);
-          }
-        } else {
-          console.log('Favicon request failed:', candidate, 'status:', response.status);
-        }
-      } catch (e) {
-        console.log('Error fetching favicon:', candidate, 'error:', e.message);
-      }
-    }
-
-    if (!faviconUrl && domain.includes('github.com')) {
-      console.log('Trying GitHub specific favicon');
-      try {
-        const githubFavicon = 'https://github.githubassets.com/favicon.ico';
-        const response = await fetch(githubFavicon, {
-          method: 'GET',
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-          }
-        });
-        if (response.ok) {
-          console.log('GitHub favicon found:', githubFavicon);
-          faviconUrl = githubFavicon;
-          faviconData = await response.arrayBuffer();
-        } else {
-          console.log('GitHub favicon request failed:', response.status);
-        }
-      } catch (e) {
-        console.log('Error fetching GitHub favicon:', e.message);
-      }
-    }
-
-    if (!faviconUrl && domain.includes('google.com')) {
-      console.log('Trying Google specific favicon');
-      try {
-        const googleFavicon = 'https://www.google.com/favicon.ico';
-        const response = await fetch(googleFavicon, {
-          method: 'GET',
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-          }
-        });
-        if (response.ok) {
-          console.log('Google favicon found:', googleFavicon);
-          faviconUrl = googleFavicon;
-          faviconData = await response.arrayBuffer();
-        } else {
-          console.log('Google favicon request failed:', response.status);
-        }
-      } catch (e) {
-        console.log('Error fetching Google favicon:', e.message);
-      }
-    }
-
-    if (faviconUrl && faviconData) {
-      console.log('Generating different sizes for favicon');
-      const favicons = await generateFaviconSizes(faviconData);
-
-      return new Response(JSON.stringify({
-        title: websiteInfo.title || fullUrl.hostname,
-        description: websiteInfo.description || '',
+    if (found.url) {
+      const favicons = await generateFaviconSizes(found.data, found.contentType);
+      return jsonResponse({
+        title: found.title || new URL(targetUrl).hostname,
+        description: found.description || '',
         url: targetUrl,
-        faviconUrl: faviconUrl,
+        faviconUrl: found.url,
         favicons: favicons
-      }), {
-        headers: { 'Content-Type': 'application/json' },
       });
     }
 
-    console.log('No favicon found, returning error');
-    return new Response(JSON.stringify({ error: '无法获取网站图标' }), {
-      status: 404,
-      headers: { 'Content-Type': 'application/json' },
-    });
+    return jsonResponse({ error: '无法获取网站图标' }, 404);
   } catch (error) {
-    console.log('Unexpected error:', error.message);
-    return new Response(JSON.stringify({ error: error.message }), {
-      status: 500,
-      headers: { 'Content-Type': 'application/json' },
-    });
+    return jsonResponse({ error: error.message }, 500);
   }
 }
 
 async function handleSimpleFaviconRequest(targetUrl) {
   try {
-    console.log('Received simple favicon request for:', targetUrl);
-
-    if (!targetUrl) {
-      console.log('Error: URL is required');
-      return new Response(JSON.stringify({ error: 'URL is required' }), {
-        status: 400,
-        headers: { 'Content-Type': 'application/json' },
-      });
-    }
-
     if (!targetUrl.startsWith('http://') && !targetUrl.startsWith('https://')) {
       targetUrl = 'https://' + targetUrl;
-      console.log('Added https protocol:', targetUrl);
     }
 
-    const fullUrl = new URL(targetUrl);
-    const domain = fullUrl.origin;
-    console.log('Processing domain:', domain);
+    const domain = new URL(targetUrl).origin;
+    const found = await findFavicon(domain);
 
-    const websiteInfo = await fetchWebsiteInfo(domain);
-
-    let faviconCandidates = [];
-    try {
-      console.log('Fetching HTML from:', domain);
-      const htmlResponse = await fetch(domain, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        }
-      });
-      if (htmlResponse.ok) {
-        console.log('HTML fetched successfully');
-        const html = await htmlResponse.text();
-        faviconCandidates = extractAllFaviconsFromHTML(html, domain);
-        console.log('Extracted favicon candidates from HTML:', faviconCandidates);
-
-        if (!websiteInfo.title) {
-          websiteInfo.title = extractTitleFromHTML(html);
-        }
-        if (!websiteInfo.description) {
-          websiteInfo.description = extractDescriptionFromHTML(html);
-        }
-      } else {
-        console.log('HTML fetch failed with status:', htmlResponse.status);
-      }
-    } catch (e) {
-      console.log('Error fetching HTML:', e.message);
-    }
-
-    const commonPaths = [
-      '/favicon.ico',
-      '/apple-touch-icon.png',
-      '/apple-touch-icon-precomposed.png',
-      '/favicon.png',
-      '/favicon.svg',
-      '/static/favicon.ico',
-      '/static/favicon.png',
-      '/assets/favicon.ico',
-      '/assets/favicon.png',
-      '/img/favicon.ico',
-      '/img/favicon.png'
-    ];
-
-    for (const path of commonPaths) {
-      const faviconUrl = new URL(path, domain).href;
-      if (!faviconCandidates.includes(faviconUrl)) {
-        faviconCandidates.push(faviconUrl);
-      }
-    }
-
-    if (domain.includes('github.com')) {
-      faviconCandidates.push('https://github.com/favicon.ico');
-      faviconCandidates.push('https://github.githubassets.com/favicon.ico');
-    } else if (domain.includes('google.com')) {
-      faviconCandidates.push('https://www.google.com/favicon.ico');
-    } else if (domain.includes('twitter.com') || domain.includes('x.com')) {
-      faviconCandidates.push('https://abs.twimg.com/favicons/twitter.ico');
-    } else if (domain.includes('facebook.com')) {
-      faviconCandidates.push('https://www.facebook.com/favicon.ico');
-    } else if (domain.includes('instagram.com')) {
-      faviconCandidates.push('https://www.instagram.com/favicon.ico');
-    }
-
-    console.log('All favicon candidates:', faviconCandidates);
-
-    let faviconData = null;
-    let faviconUrl = null;
-
-    for (const candidate of faviconCandidates) {
-      try {
-        console.log('Trying favicon:', candidate);
-        const response = await fetch(candidate, {
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-          },
-          redirect: 'follow'
-        });
-
-        if (response.ok) {
-          const contentType = response.headers.get('content-type');
-          console.log('Favicon found with content-type:', contentType);
-
-          if (contentType && contentType.startsWith('image/')) {
-            if (contentType === 'image/svg+xml') {
-              console.log('Skipping SVG favicon:', candidate);
-              continue;
-            }
-
-            faviconData = await response.arrayBuffer();
-            faviconUrl = candidate;
-            console.log('Favicon data received, length:', faviconData.byteLength);
-            break;
-          } else {
-            console.log('Not an image:', contentType);
-          }
-        } else {
-          console.log('Favicon request failed with status:', response.status);
-        }
-      } catch (e) {
-        console.log('Error fetching favicon:', e.message);
-      }
-    }
-
-    if (faviconData) {
-      console.log('Favicon found, returning image');
-      return new Response(faviconData, {
-        headers: { 'Content-Type': 'image/png' },
+    if (found.url) {
+      return new Response(found.data, {
+        headers: { 'Content-Type': found.contentType || 'image/x-icon' }
       });
     }
 
-    console.log('No favicon found, returning error');
-    return new Response(JSON.stringify({ error: '无法获取网站图标' }), {
-      status: 404,
-      headers: { 'Content-Type': 'application/json' },
-    });
+    return jsonResponse({ error: '无法获取网站图标' }, 404);
   } catch (error) {
-    console.log('Unexpected error:', error.message);
-    return new Response(JSON.stringify({ error: error.message }), {
-      status: 500,
-      headers: { 'Content-Type': 'application/json' },
-    });
+    return jsonResponse({ error: error.message }, 500);
   }
 }
 
-async function fetchWebsiteInfo(domain) {
-  const info = { title: '', description: '' };
+// 找 favicon：解析页面声明 → 常见路径 → 站点特判 → 公共服务兜底，逐个尝试直到拿到真图片
+async function findFavicon(domain) {
+  const hostname = new URL(domain).hostname;
+  const out = { url: null, data: null, contentType: null, title: '', description: '' };
+  const candidates = [];
 
+  // 1) 抓首页 HTML，顺便拿 title/description 和图标声明
   try {
-    const response = await fetch(domain, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-      }
+    const res = await fetch(domain, {
+      headers: { 'User-Agent': UA, 'Accept': 'text/html,application/xhtml+xml' }
     });
-
-    if (response.ok) {
-      const html = await response.text();
-      info.title = extractTitleFromHTML(html);
-      info.description = extractDescriptionFromHTML(html);
+    if (res.ok) {
+      const html = await res.text();
+      out.title = extractTitleFromHTML(html);
+      out.description = extractDescriptionFromHTML(html);
+      candidates.push(...extractAllFaviconsFromHTML(html, domain));
     }
-  } catch (e) {
-    console.log('Error fetching website info:', e.message);
+  } catch (e) {}
+
+  // 2) 常见路径
+  const commonPaths = [
+    '/favicon.ico', '/favicon.png', '/favicon.svg',
+    '/apple-touch-icon.png', '/apple-touch-icon-precomposed.png',
+    '/apple-touch-icon-180x180.png', '/apple-touch-icon-152x152.png',
+    '/favicon-32x32.png', '/favicon-16x16.png', '/favicon-48x48.png',
+    '/android-chrome-192x192.png', '/android-chrome-512x512.png', '/android-chrome-96x96.png',
+    '/mstile-150x150.png',
+    '/static/favicon.ico', '/static/favicon.png',
+    '/assets/favicon.ico', '/assets/favicon.png',
+    '/img/favicon.ico', '/img/favicon.png', '/images/favicon.ico'
+  ];
+  for (const p of commonPaths) candidates.push(new URL(p, domain).href);
+
+  // 3) 站点特判
+  if (hostname.includes('github.com')) {
+    candidates.push('https://github.githubassets.com/favicon.ico');
+  } else if (hostname.includes('google.')) {
+    candidates.push('https://www.google.com/favicon.ico');
+  } else if (hostname.includes('twitter.com') || hostname.includes('x.com')) {
+    candidates.push('https://abs.twimg.com/favicons/twitter.ico');
+  } else if (hostname.includes('facebook.com')) {
+    candidates.push('https://www.facebook.com/favicon.ico');
+  } else if (hostname.includes('instagram.com')) {
+    candidates.push('https://www.instagram.com/favicon.ico');
+  } else if (hostname.includes('youtube.com')) {
+    candidates.push('https://www.youtube.com/s/desktop/favicon.ico');
   }
 
-  return info;
+  // 4) 公共服务兜底（最可靠，能绕过反爬）
+  candidates.push(
+    'https://www.google.com/s2/favicons?domain=' + hostname + '&sz=256',
+    'https://icons.duckduckgo.com/ip3/' + hostname + '.ico',
+    'https://www.google.com/s2/favicons?domain=' + hostname + '&sz=64'
+  );
+
+  // 去重，保留顺序
+  const seen = new Set();
+  const unique = [];
+  for (const c of candidates) {
+    if (c && !seen.has(c)) { seen.add(c); unique.push(c); }
+  }
+
+  // 逐个尝试
+  for (const candidate of unique) {
+    try {
+      let contentType = '';
+      let buf = null;
+
+      // 内联 data URI 直接解码，不走 fetch
+      if (candidate.startsWith('data:')) {
+        const parsed = decodeDataUri(candidate);
+        if (!parsed) continue;
+        contentType = parsed.mime;
+        buf = parsed.data;
+      } else {
+        const res = await fetch(candidate, {
+          headers: { 'User-Agent': UA, 'Accept': 'image/*,*/*;q=0.8' },
+          redirect: 'follow'
+        });
+        if (!res.ok) continue;
+        contentType = (res.headers.get('content-type') || '').toLowerCase();
+        buf = await res.arrayBuffer();
+      }
+
+      if (!buf || buf.byteLength < 4) continue;
+
+      const sniffed = sniffImageType(buf);
+      // 明确是文本/HTML/JSON（软 404 或反爬页）且魔数认不出图片 → 跳过
+      if (/text\/|application\/(json|xhtml)/.test(contentType) && !sniffed) continue;
+      // 有 content-type 但不是图片、魔数也认不出 → 跳过
+      if (contentType && !/image\/|icon/.test(contentType) && !sniffed) continue;
+
+      out.url = candidate;
+      out.data = buf;
+      out.contentType = sniffed || (contentType.includes('svg') ? 'image/svg+xml' : 'image/x-icon');
+      return out;
+    } catch (e) {}
+  }
+
+  return out;
 }
 
 function extractTitleFromHTML(html) {
@@ -584,43 +382,121 @@ function extractDescriptionFromHTML(html) {
   return match ? match[1].trim() : '';
 }
 
+// 取属性值：先按双引号包裹取（内部允许单引号），再退到单引号包裹（内部允许双引号）
+// 用 [^"']+ 会在 data URI 里的单引号（如 font-family 的 'Segoe UI'）处截断
+function attrValue(tag, namePattern) {
+  const dq = tag.match(new RegExp('(?:' + namePattern + ')\\s*=\\s*"([^"]*)"', 'i'));
+  if (dq) return dq[1];
+  const sq = tag.match(new RegExp("(?:' + namePattern + ')\\s*=\\s*'([^']*)'", 'i'));
+  if (sq) return sq[1];
+  return '';
+}
+
+// 解析 HTML 里声明的图标：不依赖属性顺序，覆盖 icon/apple-touch-icon/mask-icon/manifest
 function extractAllFaviconsFromHTML(html, baseUrl) {
   const candidates = [];
-
-  const linkRegexes = [
-    /<link[^>]+rel=["']?icon["']?[^>]+href=["']([^"']+)["']/gi,
-    /<link[^>]+rel=["']?shortcut icon["']?[^>]+href=["']([^"']+)["']/gi,
-    /<link[^>]+rel=["']?apple-touch-icon["']?[^>]+href=["']([^"']+)["']/gi,
-    /<link[^>]+rel=["']?apple-touch-icon-precomposed["']?[^>]+href=["']([^"']+)["']/gi,
-    /<link[^>]+rel=["']?manifest["']?[^>]+href=["']([^"']+)["']/gi
-  ];
-
-  for (const regex of linkRegexes) {
-    let match;
-    while ((match = regex.exec(html)) !== null) {
-      let href = match[1];
-      if (!href.startsWith('http')) {
-        href = new URL(href, baseUrl).href;
-      }
-      candidates.push(href);
+  const linkRegex = /<link\b[^>]*>/gi;
+  let m;
+  while ((m = linkRegex.exec(html)) !== null) {
+    const tag = m[0];
+    const href = attrValue(tag, 'href');
+    if (!href) continue;
+    const rel = attrValue(tag, 'rel').toLowerCase();
+    if (/\bicon\b/.test(rel) || /apple-touch-icon/.test(rel) || /mask-icon/.test(rel) || /manifest/.test(rel)) {
+      const full = href.startsWith('data:') ? href : resolveUrl(href, baseUrl);
+      if (full) candidates.push(full);
     }
   }
 
+  // og:image / twitter:image 兜底
+  const metaRegex = /<meta\b[^>]*>/gi;
+  while ((m = metaRegex.exec(html)) !== null) {
+    const tag = m[0];
+    const prop = attrValue(tag, 'property|name').toLowerCase();
+    if (prop !== 'og:image' && prop !== 'twitter:image') continue;
+    const content = attrValue(tag, 'content');
+    if (content) {
+      const full = content.startsWith('data:') ? content : resolveUrl(content, baseUrl);
+      if (full) candidates.push(full);
+    }
+  }
   return candidates;
 }
 
-async function generateFaviconSizes(iconData) {
+function resolveUrl(href, baseUrl) {
+  if (/^https?:\/\//i.test(href)) return href;
+  if (href.startsWith('//')) return 'https:' + href;
+  try { return new URL(href, baseUrl).href; } catch (e) { return null; }
+}
+
+// 解码 data URI（data:image/svg+xml,%3Csvg... 或 data:image/png;base64,...），返回 {mime, data}
+function decodeDataUri(uri) {
+  const comma = uri.indexOf(',');
+  if (comma < 0) return null;
+  const meta = uri.slice(5, comma);
+  const payload = uri.slice(comma + 1);
+  let mime = 'text/plain';
+  let isBase64 = false;
+  for (const part of meta.split(';')) {
+    if (part.includes('/')) mime = part;
+    else if (part.toLowerCase() === 'base64') isBase64 = true;
+  }
+  try {
+    if (isBase64) {
+      const bin = atob(payload);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      return { mime: mime.toLowerCase(), data: bytes.buffer };
+    }
+    const text = decodeURIComponent(payload);
+    const bytes = new TextEncoder().encode(text);
+    return { mime: mime.toLowerCase(), data: bytes.buffer };
+  } catch (e) {
+    return null;
+  }
+}
+
+// 按魔数识别图片类型，避免把软 404 的 HTML 当图标；SVG 是文本需单独识别
+function sniffImageType(buf) {
+  const b = new Uint8Array(buf);
+  if (b.length < 4) return null;
+  if (b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47) return 'image/png';
+  if (b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return 'image/jpeg';
+  if (b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x38) return 'image/gif';
+  if (b[0] === 0x00 && b[1] === 0x00 && b[2] === 0x01 && b[3] === 0x00) return 'image/x-icon';
+  if (b[0] === 0x52 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x46 &&
+      b[8] === 0x57 && b[9] === 0x45 && b[10] === 0x42 && b[11] === 0x50) return 'image/webp';
+  if (b[0] === 0x42 && b[1] === 0x4d) return 'image/bmp';
+  const head = new TextDecoder().decode(b.slice(0, 256)).trimStart().toLowerCase();
+  if (head.startsWith('<svg') || (head.startsWith('<?xml') && head.includes('<svg'))) return 'image/svg+xml';
+  return null;
+}
+
+function toBase64(buf) {
+  const bytes = new Uint8Array(buf);
+  let binary = '';
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+  }
+  return btoa(binary);
+}
+
+async function generateFaviconSizes(iconData, mime) {
   const sizes = ['16', '32', '64', '128', '256'];
   const favicons = {};
-
-  const base64 = btoa(String.fromCharCode(...new Uint8Array(iconData)));
-  const dataUrl = 'data:image/png;base64,' + base64;
-
+  const dataUrl = 'data:' + (mime || 'image/x-icon') + ';base64,' + toBase64(iconData);
   for (const size of sizes) {
     favicons[size] = dataUrl;
   }
-
   return favicons;
+}
+
+function jsonResponse(obj, status) {
+  return new Response(JSON.stringify(obj), {
+    status: status || 200,
+    headers: { 'Content-Type': 'application/json' }
+  });
 }
 
 async function fetchWebsite(targetUrl) {
@@ -843,7 +719,7 @@ function getFrontendHTML(PASSWORD) {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
     <title>ZQ-HtmlIco</title>
-    <link rel="icon" href="http://img.520jk.cc.cd/i/2026/10/10/957246.svg" type="image/webp">
+    <link rel="icon" href="https://img.520jk.cc.cd/i/2026/10/18/724161.png" type="image/png">
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
     <style>
@@ -919,9 +795,9 @@ function getFrontendHTML(PASSWORD) {
                     <label class="block text-sm font-medium mb-1">输入网站URL</label>
                     <div class="flex flex-col sm:flex-row gap-2">
                         <input
-                            type="url"
+                            type="text"
                             id="urlInput"
-                            placeholder="https://example.com"
+                            placeholder="example.com"
                             class="flex-1 px-4 py-3 border rounded-lg text-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
                             required
                         >
@@ -1023,7 +899,7 @@ function getFrontendHTML(PASSWORD) {
                 <div class="space-y-4">
                     <label class="block text-sm font-medium">输入网站URL</label>
                     <div class="flex flex-col sm:flex-row gap-2">
-                        <input type="url" id="fetchUrlInput" placeholder="https://example.com" class="flex-1 px-4 py-3 border rounded-lg text-lg focus:outline-none focus:ring-2 focus:ring-blue-500" required>
+                        <input type="text" id="fetchUrlInput" placeholder="example.com" class="flex-1 px-4 py-3 border rounded-lg text-lg focus:outline-none focus:ring-2 focus:ring-blue-500" required>
                         <button type="submit" id="fetchBtn" class="bg-blue-600 hover:bg-blue-700 text-white px-6 py-3 rounded-lg text-lg transition-colors">获取源代码</button>
                     </div>
                 </div>
