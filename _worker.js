@@ -300,12 +300,12 @@ function labelOf(candidate) {
 
 // 首页 HTML：顺路拿 title / description；被 UA 拦时换个手机 UA 再来一次
 async function fetchHomePage(domain, tried) {
-  const info = { html: '', title: '', description: '' };
+  const info = { html: '', title: '', description: '', origin: '' };
+  const pageHeaders = { 'User-Agent': UA, 'Accept': 'text/html,application/xhtml+xml' };
   let res = null;
+
   try {
-    res = await fetch(domain, {
-      headers: { 'User-Agent': UA, 'Accept': 'text/html,application/xhtml+xml' }
-    });
+    res = await fetch(domain, { headers: pageHeaders, redirect: 'follow' });
     // 有些站按 UA 拦数据中心 IP：桌面 Chrome UA 被 403/429，换手机 UA 就放行
     if (res.status === 403 || res.status === 429) {
       const retry = await fetch(domain, {
@@ -316,7 +316,16 @@ async function fetchHomePage(domain, tried) {
     }
   } catch (e) {
     tried.push(domain + ' → 首页请求失败：' + (e && e.message ? e.message : e));
-    return info;
+    // 证书过期、只监听 80 端口的老站，https 根本连不上，退回 http 再要一次
+    if (!domain.startsWith('https://')) return info;
+    const httpBase = domain.replace(/^https:/, 'http:');
+    try {
+      res = await fetch(httpBase, { headers: pageHeaders, redirect: 'follow' });
+      info.origin = httpBase;
+    } catch (e2) {
+      tried.push(httpBase + ' → http 也连不上');
+      return info;
+    }
   }
 
   // 不能因为状态码不是 2xx 就放弃：登录页、错误页常常也是完整 HTML，图标就写在里面。
@@ -409,6 +418,15 @@ async function loadCandidate(candidate, ctx, tried) {
     delete headers['Referer'];
     res = await fetch(candidate, { headers, redirect: 'follow' });
   }
+  // 图标和首页往往是两套拦截规则，首页放行、图标路径却对数据中心 IP 返 403；
+  // 真鉴权的站也可能对 /favicon.ico 返 401。换手机 UA 再试一次。
+  if (!res.ok && (res.status === 401 || res.status === 403 || res.status === 429)) {
+    const alt = await fetch(candidate, {
+      headers: { 'User-Agent': MOBILE_UA, 'Accept': 'image/*,*/*;q=0.8' },
+      redirect: 'follow'
+    }).catch(() => null);
+    if (alt && alt.ok) res = alt;
+  }
   if (!res.ok) { tried.push(label + ' → HTTP ' + res.status); return null; }
 
   let contentType = (res.headers.get('content-type') || '').toLowerCase();
@@ -476,15 +494,17 @@ function acceptIcon(buf, contentType, tried, label) {
 async function findFavicon(domain, startPath) {
   const hostname = new URL(domain).hostname;
   const out = { url: null, data: null, contentType: null, title: '', description: '', tried: [] };
-  const ctx = { domain, hostname, startPath };
 
   const page = await fetchHomePage(domain, out.tried);
   out.title = page.title;
   out.description = page.description;
+  // 首页实际是用哪个协议拿到的（http 兜底时和入参不同），后面的候选也跟着它走
+  const base = page.origin || domain;
+  const ctx = { domain: base, hostname, startPath };
 
-  const declared = page.html ? extractAllFaviconsFromHTML(page.html, domain) : [];
+  const declared = page.html ? extractAllFaviconsFromHTML(page.html, base) : [];
   const candidates = await buildCandidates({
-    domain, hostname, startPath, pageHtml: page.html, declared, tried: out.tried
+    domain: base, hostname, startPath, pageHtml: page.html, declared, tried: out.tried
   });
 
   for (const candidate of candidates) {
@@ -524,13 +544,29 @@ function extractDescriptionFromHTML(html) {
 // 取属性值：先按双引号包裹取（内部允许单引号），再退到单引号包裹（内部允许双引号），
 // 最后兜住不写引号的写法（href=/favicon.ico）——以前这种直接漏掉。
 // 用 [^"']+ 会在 data URI 里的单引号（如 font-family 的 'Segoe UI'）处截断
+// 属性里的 &amp; &#x2F; 之类要还原：`href="/favicon.ico?a=1&amp;b=2"` 不解码会拼出错误地址
+function decodeEntities(s) {
+  if (!s || s.indexOf('&') < 0) return s;
+  const map = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ', sol: '/', colon: ':', period: '.', quest: '?', equals: '=' };
+  return s.replace(/&(#[xX]?[0-9a-fA-F]+|[a-zA-Z]+);/g, (all, body) => {
+    if (body[0] === '#') {
+      const code = body[1] === 'x' || body[1] === 'X'
+        ? parseInt(body.slice(2), 16)
+        : parseInt(body.slice(1), 10);
+      try { return Number.isFinite(code) && code > 0 ? String.fromCodePoint(code) : all; } catch (e) { return all; }
+    }
+    const v = map[body.toLowerCase()];
+    return v === undefined ? all : v;
+  });
+}
+
 function attrValue(tag, namePattern) {
   const dq = tag.match(new RegExp('(?:' + namePattern + ')\\s*=\\s*"([^"]*)"', 'i'));
-  if (dq) return dq[1];
+  if (dq) return decodeEntities(dq[1]);
   const sq = tag.match(new RegExp("(?:" + namePattern + ")\\s*=\\s*'([^']*)'", 'i'));
-  if (sq) return sq[1];
+  if (sq) return decodeEntities(sq[1]);
   const bare = tag.match(new RegExp('(?:' + namePattern + ')\\s*=\\s*([^\\s"\'`=<>]+)', 'i'));
-  if (bare) return bare[1];
+  if (bare) return decodeEntities(bare[1]);
   return '';
 }
 
@@ -559,6 +595,8 @@ function maxSizeOf(tag) {
 // 解析 HTML 里声明的图标：不依赖属性顺序，覆盖 icon/apple-touch-icon/mask-icon/manifest
 // 标签用「引号感知」的写法：data: URI 的 SVG 里带 '>'，[^>]* 会在那里提前截断
 function extractAllFaviconsFromHTML(html, baseUrl) {
+  // 被注释掉的 <link> 不算真声明，先剥掉，免得把注释里的旧地址当候选
+  html = html.replace(/<!--[\s\S]*?-->/g, '');
   const found = [];
   const base = baseHrefOf(html);
   const resolveBase = base ? (resolveUrl(base, baseUrl) || baseUrl) : baseUrl;
@@ -598,6 +636,7 @@ function extractAllFaviconsFromHTML(html, baseUrl) {
 
 // <link rel="manifest">：很多站点只在 manifest 里列图标
 function extractManifestUrl(html, baseUrl) {
+  html = html.replace(/<!--[\s\S]*?-->/g, '');
   const linkRegex = /<link\b(?:"[^"]*"|'[^']*'|[^>"'])*>/gi;
   let m;
   while ((m = linkRegex.exec(html)) !== null) {
@@ -644,6 +683,7 @@ async function fetchManifestIcons(manifestUrl) {
 // 标签解析会在第一个内层双引号处截断；这里按 SVG 的 </svg> 或 base64 的引号边界取完整 URI。
 function extractInlineDataIcons(html) {
   const out = [];
+  html = html.replace(/<!--[\s\S]*?-->/g, '');
   const re = /data:image\/(?:svg\+xml|x-icon|png|vnd\.microsoft\.icon)/gi;
   const lower = html.toLowerCase();
   let m;
@@ -688,7 +728,10 @@ function decodeDataUri(uri) {
   }
   try {
     if (isBase64) {
-      const bin = atob(payload);
+      // 有些站把 base64 的 = 省略了，atob 会直接抛错
+      let b64 = payload.replace(/\s+/g, '');
+      while (b64.length % 4) b64 += '=';
+      const bin = atob(b64);
       const bytes = new Uint8Array(bin.length);
       for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
       return { mime: mime.toLowerCase(), data: bytes.buffer };
@@ -719,8 +762,13 @@ function sniffImageType(buf) {
   if (b[0] === 0x52 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x46 &&
       b[8] === 0x57 && b[9] === 0x45 && b[10] === 0x42 && b[11] === 0x50) return 'image/webp';
   if (b[0] === 0x42 && b[1] === 0x4d) return 'image/bmp';
-  const head = new TextDecoder().decode(b.slice(0, 256)).trimStart().toLowerCase();
-  if (head.startsWith('<svg') || (head.startsWith('<?xml') && head.includes('<svg'))) return 'image/svg+xml';
+  // 去掉 BOM 和开头的注释：有些 SVG 前面挂着 <!-- Generator: ... -->，不剥掉会认不出来
+  const head = new TextDecoder().decode(b.slice(0, 512))
+    .replace(/^\uFEFF/, '')
+    .replace(/^\s*<!--[\s\S]*?-->/, '')
+    .trimStart()
+    .toLowerCase();
+  if (head.startsWith('<svg') || head.startsWith('<?xml') && head.includes('<svg')) return 'image/svg+xml';
   return null;
 }
 
