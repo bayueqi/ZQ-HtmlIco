@@ -1,6 +1,22 @@
-// 配置
+/* ========================================================================== *
+ *  ZQ-HtmlIco — Cloudflare Worker 单文件版
+ *
+ *  分区索引：
+ *    一、配置与入口        常量、默认密码、路由分发
+ *    二、登录与登录页      密码校验、登录页 HTML
+ *    三、图标接口          POST /api/favicon、GET /<密码>/<域名>
+ *    四、图标抓取          取首页 → 建候选 → 取字节 → 校验，ICO 解出 PNG
+ *    五、HTML 解析与图片工具
+ *    六、网页资源抓取      整站 HTML + 资源代理
+ *    七、前端页面          面板的 HTML/CSS/JS
+ * ========================================================================== */
+
+/* ---------- 一、配置与入口 ---------- */
+
 const DEFAULT_PASSWORD = 'zq-htmlico';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+// 首页被拦时换手机 UA 重试：一部分站只放行移动端 UA
+const MOBILE_UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
 
 function getPasswordAttribute(password) {
   return `data-password="${password}"`;
@@ -16,91 +32,55 @@ export default {
 
 async function handleRequest(request, PASSWORD) {
   const url = new URL(request.url);
+  const isLoggedIn = await checkLoginStatus(request);
 
-  // 处理登录请求
+  // 登录
   if (url.pathname === '/login' && request.method === 'POST') {
     return handleLoginRequest(request, PASSWORD);
   }
 
-  // 检查是否已登录
-  const isLoggedIn = await checkLoginStatus(request);
-
-  // 处理 favicon API
+  // 图标 API（JSON）。未登录也能用，只要 body 里带 password。
+  // 注意：body 只能读一次，所以在这里读完把 url 传下去，别让下游再读 request。
   if (url.pathname === '/api/favicon') {
-    if (!isLoggedIn) {
-      try {
-        const data = await request.json();
-        if (data.password === PASSWORD) {
-          return handleFaviconRequest(request, true);
-        }
-      } catch (e) {
-      }
-      return new Response(JSON.stringify({ error: '需要密码验证' }), {
-        status: 401,
-        headers: { 'Content-Type': 'application/json' }
-      });
+    const body = await request.json().catch(() => ({}));
+    if (!isLoggedIn && body.password !== PASSWORD) {
+      return jsonResponse({ error: '需要密码验证' }, 401);
     }
-    return handleFaviconRequest(request, true);
+    return handleFaviconRequest(body.url);
   }
 
-  // 处理简单 favicon API
-  const pathParts = url.pathname.split('/').filter(Boolean);
-  if (pathParts.length === 2) {
-    const [providedPassword, targetDomain] = pathParts;
-    if (providedPassword === PASSWORD) {
-      let targetUrl = targetDomain;
-      if (!targetUrl.startsWith('http://') && !targetUrl.startsWith('https://')) {
-        targetUrl = 'https://' + targetUrl;
-      }
-      return handleSimpleFaviconRequest(targetUrl);
-    } else {
-      return new Response(JSON.stringify({ error: '密码错误' }), {
-        status: 401,
-        headers: { 'Content-Type': 'application/json' }
-      });
-    }
+  // 简单图标 API：/<密码>/<域名>，直接返回图片字节
+  const parts = url.pathname.split('/').filter(Boolean);
+  if (parts.length === 2) {
+    if (parts[0] !== PASSWORD) return jsonResponse({ error: '密码错误' }, 401);
+    return handleSimpleFaviconRequest(parts[1]);
   }
 
-  // 处理 htmlcode.js 的原有 API
+  // 整站 HTML 抓取
   if (url.pathname === '/fetch' && request.method === 'POST') {
-    if (!isLoggedIn) {
-      return new Response(JSON.stringify({ error: '需要密码验证' }), {
-        status: 401,
-        headers: { 'Content-Type': 'application/json' }
-      });
-    }
+    if (!isLoggedIn) return jsonResponse({ error: '需要密码验证' }, 401);
     const formData = await request.formData();
     const targetUrl = formData.get('url');
-    if (!targetUrl) {
-      return new Response('请输入网址', { status: 400 });
-    }
+    if (!targetUrl) return new Response('请输入网址', { status: 400 });
     return fetchWebsite(targetUrl);
   }
 
+  // 单个资源代理
   if (url.pathname === '/proxy' && request.method === 'POST') {
-    if (!isLoggedIn) {
-      return new Response('需要密码验证', { status: 401 });
-    }
+    if (!isLoggedIn) return new Response('需要密码验证', { status: 401 });
     const formData = await request.formData();
     const resourceUrl = formData.get('url');
-    if (!resourceUrl) {
-      return new Response('请输入资源地址', { status: 400 });
-    }
+    if (!resourceUrl) return new Response('请输入资源地址', { status: 400 });
     return proxyResource(resourceUrl);
   }
 
-  // 如果未登录，返回登录页面
-  if (!isLoggedIn) {
-    return new Response(getLoginHTML(PASSWORD), {
-      headers: { 'Content-Type': 'text/html; charset=utf-8' }
-    });
-  }
-
-  // 返回主页面
-  return new Response(getFrontendHTML(PASSWORD), {
+  const page = isLoggedIn ? getFrontendHTML(PASSWORD) : getLoginHTML(PASSWORD);
+  return new Response(page, {
     headers: { 'Content-Type': 'text/html; charset=utf-8' }
   });
 }
+
+/* ---------- 二、登录与登录页 ---------- */
 
 async function handleLoginRequest(request, PASSWORD) {
   try {
@@ -218,159 +198,312 @@ function getLoginHTML(PASSWORD) {
   `;
 }
 
-async function handleFaviconRequest(request, isLoggedIn) {
+/* ========================================================================== *
+ *  三、图标接口
+ * ========================================================================== */
+
+// 用户可能只输入 example.com，补协议后统一成 URL
+function normalizeTargetUrl(input) {
+  const s = String(input == null ? '' : input).trim();
+  if (!s) return '';
+  return /^https?:\/\//i.test(s) ? s : 'https://' + s;
+}
+
+// 两个图标接口共用：规范化 → 找图标
+async function resolveFavicon(targetUrl) {
+  const parsed = new URL(targetUrl);
+  const found = await findFavicon(parsed.origin, parsed.pathname);
+  return { parsed, found };
+}
+
+// POST /api/favicon：返回 JSON（title / description / 多尺寸 data URI）
+async function handleFaviconRequest(inputUrl) {
   try {
-    const body = await request.json();
-    let targetUrl = body.url;
-    if (!targetUrl) {
-      return jsonResponse({ error: 'URL is required' }, 400);
-    }
-    if (!targetUrl.startsWith('http://') && !targetUrl.startsWith('https://')) {
-      targetUrl = 'https://' + targetUrl;
-    }
+    const targetUrl = normalizeTargetUrl(inputUrl);
+    if (!targetUrl) return jsonResponse({ error: 'URL is required' }, 400);
 
-    const domain = new URL(targetUrl).origin;
-    const found = await findFavicon(domain);
-
-    if (found.url) {
-      const favicons = await generateFaviconSizes(found.data, found.contentType);
-      return jsonResponse({
-        title: found.title || new URL(targetUrl).hostname,
-        description: found.description || '',
-        url: targetUrl,
-        faviconUrl: found.url,
-        favicons: favicons
-      });
+    const { parsed, found } = await resolveFavicon(targetUrl);
+    if (!found.url) {
+      return jsonResponse({ error: '无法获取网站图标', tried: found.tried.slice(0, 40) }, 404);
     }
-
-    return jsonResponse({ error: '无法获取网站图标' }, 404);
+    return jsonResponse({
+      title: found.title || parsed.hostname,
+      description: found.description || '',
+      url: targetUrl,
+      faviconUrl: found.url,
+      favicons: await generateFaviconSizes(found.data, found.contentType)
+    });
   } catch (error) {
     return jsonResponse({ error: error.message }, 500);
   }
 }
 
+// GET /<密码>/<域名>：直接吐图片字节
 async function handleSimpleFaviconRequest(targetUrl) {
   try {
-    if (!targetUrl.startsWith('http://') && !targetUrl.startsWith('https://')) {
-      targetUrl = 'https://' + targetUrl;
-    }
-
-    const domain = new URL(targetUrl).origin;
-    const found = await findFavicon(domain);
-
-    if (found.url) {
-      return new Response(found.data, {
-        headers: { 'Content-Type': found.contentType || 'image/x-icon' }
-      });
-    }
-
-    return jsonResponse({ error: '无法获取网站图标' }, 404);
+    const { found } = await resolveFavicon(normalizeTargetUrl(targetUrl));
+    if (!found.url) return jsonResponse({ error: '无法获取网站图标' }, 404);
+    return new Response(found.data, {
+      headers: { 'Content-Type': found.contentType || 'image/x-icon' }
+    });
   } catch (error) {
     return jsonResponse({ error: error.message }, 500);
   }
 }
 
-// 找 favicon：解析页面声明 → 常见路径 → 站点特判 → 公共服务兜底，逐个尝试直到拿到真图片
-async function findFavicon(domain) {
-  const hostname = new URL(domain).hostname;
-  const out = { url: null, data: null, contentType: null, title: '', description: '' };
-  const candidates = [];
+/* ========================================================================== *
+ *  四、图标抓取
+ *      fetchHomePage · buildCandidates · loadCandidate · acceptIcon · findFavicon
+ * ========================================================================== */
 
-  // 1) 抓首页 HTML，顺便拿 title/description 和图标声明
+// 兜底路径：绝大多数站点的图标就在这几个位置
+const COMMON_ICON_PATHS = [
+  '/favicon.ico', '/favicon.png', '/favicon.svg',
+  '/apple-touch-icon.png', '/apple-touch-icon-precomposed.png',
+  '/apple-touch-icon-180x180.png', '/apple-touch-icon-152x152.png',
+  '/favicon-32x32.png', '/favicon-16x16.png', '/favicon-48x48.png',
+  '/android-chrome-192x192.png', '/android-chrome-512x512.png', '/android-chrome-96x96.png',
+  '/mstile-150x150.png',
+  '/static/favicon.ico', '/static/favicon.png',
+  '/assets/favicon.ico', '/assets/favicon.png',
+  '/img/favicon.ico', '/img/favicon.png', '/images/favicon.ico'
+];
+
+// 少数站点图标不在自己域名下，只能用固定地址
+const SITE_ICON_OVERRIDES = [
+  [/github\.com$/, 'https://github.githubassets.com/favicon.ico'],
+  [/google\./, 'https://www.google.com/favicon.ico'],
+  [/(twitter|x)\.com$/, 'https://abs.twimg.com/favicons/twitter.ico'],
+  [/facebook\.com$/, 'https://www.facebook.com/favicon.ico'],
+  [/instagram\.com$/, 'https://www.instagram.com/favicon.ico'],
+  [/youtube\.com$/, 'https://www.youtube.com/s/desktop/favicon.ico']
+];
+
+// 公共服务兜底：自己拿不到时最后试，能绕过一部分反爬
+function publicIconApis(hostname) {
+  return [
+    'https://icons.duckduckgo.com/ip3/' + hostname + '.ico',
+    'https://www.google.com/s2/favicons?domain=' + hostname + '&sz=256',
+    'https://www.google.com/s2/favicons?domain=' + hostname + '&sz=64'
+  ];
+}
+
+// 文本类响应（软 404、反爬页、旧缓存）：魔数认不出图片就说明不是图标
+function isTextResponse(contentType) {
+  return /text\/|application\/(json|xhtml)/.test(contentType || '');
+}
+
+// data URI 太长，日志里只留开头
+function labelOf(candidate) {
+  return candidate.startsWith('data:') ? candidate.slice(0, 32) + '...' : candidate;
+}
+
+// 首页 HTML：顺路拿 title / description；被 UA 拦时换个手机 UA 再来一次
+async function fetchHomePage(domain, tried) {
+  const info = { html: '', title: '', description: '' };
+  let res = null;
   try {
-    const res = await fetch(domain, {
+    res = await fetch(domain, {
       headers: { 'User-Agent': UA, 'Accept': 'text/html,application/xhtml+xml' }
     });
-    if (res.ok) {
-      const html = await res.text();
-      out.title = extractTitleFromHTML(html);
-      out.description = extractDescriptionFromHTML(html);
-      candidates.push(...extractAllFaviconsFromHTML(html, domain));
+    // 有些站按 UA 拦数据中心 IP：桌面 Chrome UA 被 403，换手机 UA 就放行
+    if (!res.ok) {
+      const retry = await fetch(domain, {
+        headers: { 'User-Agent': MOBILE_UA, 'Accept': 'text/html,application/xhtml+xml' },
+        redirect: 'follow'
+      }).catch(() => null);
+      if (retry && retry.ok) res = retry;
     }
-  } catch (e) {}
-
-  // 2) 常见路径
-  const commonPaths = [
-    '/favicon.ico', '/favicon.png', '/favicon.svg',
-    '/apple-touch-icon.png', '/apple-touch-icon-precomposed.png',
-    '/apple-touch-icon-180x180.png', '/apple-touch-icon-152x152.png',
-    '/favicon-32x32.png', '/favicon-16x16.png', '/favicon-48x48.png',
-    '/android-chrome-192x192.png', '/android-chrome-512x512.png', '/android-chrome-96x96.png',
-    '/mstile-150x150.png',
-    '/static/favicon.ico', '/static/favicon.png',
-    '/assets/favicon.ico', '/assets/favicon.png',
-    '/img/favicon.ico', '/img/favicon.png', '/images/favicon.ico'
-  ];
-  for (const p of commonPaths) candidates.push(new URL(p, domain).href);
-
-  // 3) 站点特判
-  if (hostname.includes('github.com')) {
-    candidates.push('https://github.githubassets.com/favicon.ico');
-  } else if (hostname.includes('google.')) {
-    candidates.push('https://www.google.com/favicon.ico');
-  } else if (hostname.includes('twitter.com') || hostname.includes('x.com')) {
-    candidates.push('https://abs.twimg.com/favicons/twitter.ico');
-  } else if (hostname.includes('facebook.com')) {
-    candidates.push('https://www.facebook.com/favicon.ico');
-  } else if (hostname.includes('instagram.com')) {
-    candidates.push('https://www.instagram.com/favicon.ico');
-  } else if (hostname.includes('youtube.com')) {
-    candidates.push('https://www.youtube.com/s/desktop/favicon.ico');
+  } catch (e) {
+    tried.push(domain + ' → 首页请求失败：' + (e && e.message ? e.message : e));
+    return info;
   }
 
-  // 4) 公共服务兜底（最可靠，能绕过反爬）
-  candidates.push(
-    'https://www.google.com/s2/favicons?domain=' + hostname + '&sz=256',
-    'https://icons.duckduckgo.com/ip3/' + hostname + '.ico',
-    'https://www.google.com/s2/favicons?domain=' + hostname + '&sz=64'
-  );
+  if (!res.ok) {
+    tried.push(domain + ' → 首页 HTTP ' + res.status);
+    return info;
+  }
+
+  try {
+    info.html = await res.text();
+  } catch (e) {
+    tried.push(domain + ' → 首页读取失败：' + (e && e.message ? e.message : e));
+    return info;
+  }
+  info.title = extractTitleFromHTML(info.html);
+  info.description = extractDescriptionFromHTML(info.html);
+  return info;
+}
+
+// 候选清单：页面声明 → manifest → 常见路径 → 子目录 → 内联 data: → 站点特判 → 公共服务
+async function buildCandidates(ctx) {
+  const { domain, hostname, startPath, pageHtml, declared, tried } = ctx;
+  const list = declared.slice();
+
+  // 页面没写图标、只挂了 manifest 的站点：去 manifest 里拿 icons[]
+  if (!declared.length && pageHtml) {
+    const manifestUrl = extractManifestUrl(pageHtml, domain);
+    if (manifestUrl) {
+      const icons = await fetchManifestIcons(manifestUrl);
+      if (icons.length) {
+        tried.push(manifestUrl + ' → manifest 里取到 ' + icons.length + ' 个图标');
+        list.push(...icons);
+      }
+    }
+  }
+
+  for (const p of COMMON_ICON_PATHS) list.push(new URL(p, domain).href);
+
+  // 站点挂在子目录时（如 https://host/app/），图标常摆在同一目录下
+  const dir = (startPath || '/').replace(/[^/]*$/, '');
+  if (dir && dir !== '/') {
+    for (const p of ['favicon.ico', 'favicon.svg', 'favicon.png']) {
+      list.push(new URL(dir + p, domain).href);
+    }
+  }
+
+  // HTML 里内联的 data: 图标：放在常见路径之后，属性引号嵌套写坏时也能兜到
+  if (pageHtml) list.push(...extractInlineDataIcons(pageHtml));
+
+  for (const [re, url] of SITE_ICON_OVERRIDES) {
+    if (re.test(hostname)) { list.push(url); break; }
+  }
+
+  list.push(...publicIconApis(hostname));
 
   // 去重，保留顺序
   const seen = new Set();
   const unique = [];
-  for (const c of candidates) {
+  for (const c of list) {
     if (c && !seen.has(c)) { seen.add(c); unique.push(c); }
   }
+  return unique;
+}
 
-  // 逐个尝试
-  for (const candidate of unique) {
+// 取单个候选的字节。data URI 直接解；外链带 Referer 应对防盗链；命中旧缓存时加参数重取
+async function loadCandidate(candidate, ctx, tried) {
+  const label = labelOf(candidate);
+
+  if (candidate.startsWith('data:')) {
+    const parsed = decodeDataUri(candidate);
+    if (!parsed) { tried.push(label + ' → data URI 解码失败'); return null; }
+    return { buf: parsed.data, contentType: parsed.mime };
+  }
+
+  const headers = { 'User-Agent': UA, 'Accept': 'image/*,image/webp,*/*;q=0.8' };
+  let crossOrigin = false;
+  try {
+    crossOrigin = new URL(candidate).hostname !== ctx.hostname;
+    if (crossOrigin) headers['Referer'] = ctx.domain + '/';
+  } catch (e) {}
+
+  let res = await fetch(candidate, { headers, redirect: 'follow' });
+  // 图床普遍做防盗链，但也有反过来只认裸请求的，去掉 Referer 再试一次
+  if (!res.ok && crossOrigin && headers['Referer']) {
+    delete headers['Referer'];
+    res = await fetch(candidate, { headers, redirect: 'follow' });
+  }
+  if (!res.ok) { tried.push(label + ' → HTTP ' + res.status); return null; }
+
+  let contentType = (res.headers.get('content-type') || '').toLowerCase();
+  let buf = await res.arrayBuffer();
+
+  // 站点刚补上图标路由时，CDN 里可能还存着旧的 HTML（.ico/.png/.svg 都在默认可缓存后缀里），
+  // 而服务端请求照样读缓存 → 所有图标路径都回 HTML。加一次性参数换掉缓存键再要一次。
+  if (isTextResponse(contentType) && !sniffImageType(buf)) {
+    const bustUrl = candidate + (candidate.includes('?') ? '&' : '?') + '_zq=' + Date.now();
     try {
-      let contentType = '';
-      let buf = null;
-
-      // 内联 data URI 直接解码，不走 fetch
-      if (candidate.startsWith('data:')) {
-        const parsed = decodeDataUri(candidate);
-        if (!parsed) continue;
-        contentType = parsed.mime;
-        buf = parsed.data;
-      } else {
-        const res = await fetch(candidate, {
-          headers: { 'User-Agent': UA, 'Accept': 'image/*,*/*;q=0.8' },
-          redirect: 'follow'
-        });
-        if (!res.ok) continue;
-        contentType = (res.headers.get('content-type') || '').toLowerCase();
-        buf = await res.arrayBuffer();
+      const res2 = await fetch(bustUrl, { headers, redirect: 'follow' });
+      if (res2.ok) {
+        const ct2 = (res2.headers.get('content-type') || '').toLowerCase();
+        const buf2 = await res2.arrayBuffer();
+        if (buf2 && buf2.byteLength >= 4 && (sniffImageType(buf2) || /image\/|icon/.test(ct2))) {
+          tried.push(label + ' → 原始请求命中 CDN 旧缓存（' + contentType + '），加参数重取成功');
+          buf = buf2;
+          contentType = ct2;
+        }
       }
+    } catch (e) {}
+  }
 
-      if (!buf || buf.byteLength < 4) continue;
+  return { buf, contentType };
+}
 
-      const sniffed = sniffImageType(buf);
-      // 明确是文本/HTML/JSON（软 404 或反爬页）且魔数认不出图片 → 跳过
-      if (/text\/|application\/(json|xhtml)/.test(contentType) && !sniffed) continue;
-      // 有 content-type 但不是图片、魔数也认不出 → 跳过
-      if (contentType && !/image\/|icon/.test(contentType) && !sniffed) continue;
+// 校验字节确实是图标；ICO 顺手解出内嵌 PNG（Safari / WebView 的 <img> 不认 ICO）
+function acceptIcon(buf, contentType, tried, label) {
+  if (!buf || buf.byteLength < 4) { tried.push(label + ' → 内容为空'); return null; }
+
+  const sniffed = sniffImageType(buf);
+  // 明确是文本/HTML/JSON（软 404 或反爬页）且魔数认不出图片 → 跳过
+  if (isTextResponse(contentType) && !sniffed) {
+    tried.push(label + ' → 返回的是文本/HTML（' + contentType + '）');
+    return null;
+  }
+  // 有 content-type 但不是图片、魔数也认不出 → 跳过
+  if (contentType && !/image\/|icon/.test(contentType) && !sniffed) {
+    tried.push(label + ' → content-type 不是图片（' + contentType + '）');
+    return null;
+  }
+  // SVG 必须完整：属性里带引号时 data URI 可能被截断，半截 SVG 会渲染成空白
+  if ((sniffed || contentType).includes('svg')) {
+    const txt = new TextDecoder().decode(buf).trim();
+    if (!/<\/svg>$/i.test(txt)) {
+      tried.push(label + ' → SVG 不完整（被截断）');
+      return null;
+    }
+  }
+
+  let data = buf;
+  let type = sniffed || (contentType.includes('svg') ? 'image/svg+xml' : 'image/x-icon');
+  if (type === 'image/x-icon') {
+    const png = largestPngInIco(buf);
+    if (png) {
+      data = png;
+      type = 'image/png';
+      tried.push(label + ' → 已把 ICO 内的 PNG 帧解出（' + png.byteLength + ' 字节）');
+    }
+  }
+  return { data, type };
+}
+
+// 主流程：跑完候选清单，第一个通过校验的就是结果
+async function findFavicon(domain, startPath) {
+  const hostname = new URL(domain).hostname;
+  const out = { url: null, data: null, contentType: null, title: '', description: '', tried: [] };
+  const ctx = { domain, hostname, startPath };
+
+  const page = await fetchHomePage(domain, out.tried);
+  out.title = page.title;
+  out.description = page.description;
+
+  const declared = page.html ? extractAllFaviconsFromHTML(page.html, domain) : [];
+  const candidates = await buildCandidates({
+    domain, hostname, startPath, pageHtml: page.html, declared, tried: out.tried
+  });
+
+  for (const candidate of candidates) {
+    try {
+      const loaded = await loadCandidate(candidate, ctx, out.tried);
+      if (!loaded) continue;
+
+      const icon = acceptIcon(loaded.buf, loaded.contentType, out.tried, labelOf(candidate));
+      if (!icon) continue;
 
       out.url = candidate;
-      out.data = buf;
-      out.contentType = sniffed || (contentType.includes('svg') ? 'image/svg+xml' : 'image/x-icon');
+      out.data = icon.data;
+      out.contentType = icon.type;
       return out;
-    } catch (e) {}
+    } catch (e) {
+      out.tried.push(labelOf(candidate) + ' → 异常：' + (e && e.message ? e.message : e));
+    }
   }
 
   return out;
 }
+
+/* ========================================================================== *
+ *  五、HTML 解析与图片工具
+ * ========================================================================== */
 
 function extractTitleFromHTML(html) {
   const match = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
@@ -382,45 +515,151 @@ function extractDescriptionFromHTML(html) {
   return match ? match[1].trim() : '';
 }
 
-// 取属性值：先按双引号包裹取（内部允许单引号），再退到单引号包裹（内部允许双引号）
+// 取属性值：先按双引号包裹取（内部允许单引号），再退到单引号包裹（内部允许双引号），
+// 最后兜住不写引号的写法（href=/favicon.ico）——以前这种直接漏掉。
 // 用 [^"']+ 会在 data URI 里的单引号（如 font-family 的 'Segoe UI'）处截断
 function attrValue(tag, namePattern) {
   const dq = tag.match(new RegExp('(?:' + namePattern + ')\\s*=\\s*"([^"]*)"', 'i'));
   if (dq) return dq[1];
-  const sq = tag.match(new RegExp("(?:' + namePattern + ')\\s*=\\s*'([^']*)'", 'i'));
+  const sq = tag.match(new RegExp("(?:" + namePattern + ")\\s*=\\s*'([^']*)'", 'i'));
   if (sq) return sq[1];
+  const bare = tag.match(new RegExp('(?:' + namePattern + ')\\s*=\\s*([^\\s"\'`=<>]+)', 'i'));
+  if (bare) return bare[1];
   return '';
 }
 
+// <base href>：页面声明了基地址时，相对图标要按它解析，否则会拼到站点根上
+function baseHrefOf(html) {
+  const m = html.match(/<base\b(?:"[^"]*"|'[^']*'|[^>"'])*>/i);
+  if (!m) return '';
+  return attrValue(m[0], 'href');
+}
+
+// sizes="16x16 32x32" / "any" → 最大边长，用来优先挑大图标
+function maxSizeOf(tag) {
+  const s = attrValue(tag, 'sizes');
+  if (!s) return 0;
+  let best = 0;
+  const re = /(\d+)\s*[x×]\s*(\d+)/g;
+  let m;
+  while ((m = re.exec(s)) !== null) {
+    const v = Math.max(parseInt(m[1], 10) || 0, parseInt(m[2], 10) || 0);
+    if (v > best) best = v;
+  }
+  if (!best && /any/i.test(s)) best = 512;
+  return best;
+}
+
 // 解析 HTML 里声明的图标：不依赖属性顺序，覆盖 icon/apple-touch-icon/mask-icon/manifest
+// 标签用「引号感知」的写法：data: URI 的 SVG 里带 '>'，[^>]* 会在那里提前截断
 function extractAllFaviconsFromHTML(html, baseUrl) {
-  const candidates = [];
-  const linkRegex = /<link\b[^>]*>/gi;
+  const found = [];
+  const base = baseHrefOf(html);
+  const resolveBase = base ? (resolveUrl(base, baseUrl) || baseUrl) : baseUrl;
+
+  const linkRegex = /<link\b(?:"[^"]*"|'[^']*'|[^>"'])*>/gi;
   let m;
   while ((m = linkRegex.exec(html)) !== null) {
     const tag = m[0];
     const href = attrValue(tag, 'href');
     if (!href) continue;
     const rel = attrValue(tag, 'rel').toLowerCase();
-    if (/\bicon\b/.test(rel) || /apple-touch-icon/.test(rel) || /mask-icon/.test(rel) || /manifest/.test(rel)) {
-      const full = href.startsWith('data:') ? href : resolveUrl(href, baseUrl);
-      if (full) candidates.push(full);
+    // manifest 单独处理（要再请求一次拿里面的 icons），这里跳过
+    if (/manifest/.test(rel) && !/\bicon\b/.test(rel)) continue;
+    if (/\bicon\b/.test(rel) || /apple-touch-icon/.test(rel) || /mask-icon/.test(rel)) {
+      const full = href.startsWith('data:') ? href : resolveUrl(href, resolveBase);
+      if (full) found.push({ url: full, size: maxSizeOf(tag) });
     }
   }
 
-  // og:image / twitter:image 兜底
-  const metaRegex = /<meta\b[^>]*>/gi;
+  // og:image / twitter:image / msapplication-TileImage 兜底
+  const metaRegex = /<meta\b(?:"[^"]*"|'[^']*'|[^>"'])*>/gi;
   while ((m = metaRegex.exec(html)) !== null) {
     const tag = m[0];
     const prop = attrValue(tag, 'property|name').toLowerCase();
-    if (prop !== 'og:image' && prop !== 'twitter:image') continue;
+    if (prop !== 'og:image' && prop !== 'twitter:image' && prop !== 'msapplication-tileimage') continue;
     const content = attrValue(tag, 'content');
     if (content) {
-      const full = content.startsWith('data:') ? content : resolveUrl(content, baseUrl);
-      if (full) candidates.push(full);
+      const full = content.startsWith('data:') ? content : resolveUrl(content, resolveBase);
+      if (full) found.push({ url: full, size: 0 });
     }
   }
-  return candidates;
+
+  // 声明了尺寸的大图优先：不少站点先写 16x16 再写 512x512，按顺序取会拿到最小的
+  found.sort((a, b) => b.size - a.size);
+  return found.map((x) => x.url);
+}
+
+// <link rel="manifest">：很多站点只在 manifest 里列图标
+function extractManifestUrl(html, baseUrl) {
+  const linkRegex = /<link\b(?:"[^"]*"|'[^']*'|[^>"'])*>/gi;
+  let m;
+  while ((m = linkRegex.exec(html)) !== null) {
+    const tag = m[0];
+    if (!/\bmanifest\b/i.test(attrValue(tag, 'rel'))) continue;
+    const href = attrValue(tag, 'href');
+    if (!href) continue;
+    const full = resolveUrl(href, baseUrl);
+    if (full) return full;
+  }
+  return '';
+}
+
+// 读 manifest 的 icons[]，按尺寸从大到小返回图标地址
+async function fetchManifestIcons(manifestUrl) {
+  try {
+    const res = await fetch(manifestUrl, {
+      headers: { 'User-Agent': UA, 'Accept': 'application/manifest+json,application/json' }
+    });
+    if (!res.ok) return [];
+    const json = await res.json();
+    const icons = Array.isArray(json && json.icons) ? json.icons : [];
+    const list = [];
+    for (const it of icons) {
+      const src = it && it.src;
+      if (!src) continue;
+      const full = src.startsWith('data:') ? src : resolveUrl(src, manifestUrl);
+      if (!full) continue;
+      let size = 0;
+      const sm = /(\d+)\s*[x×]\s*(\d+)/i.exec(String(it.sizes || ''));
+      if (sm) size = Math.max(parseInt(sm[1], 10) || 0, parseInt(sm[2], 10) || 0);
+      if (!size && /any/i.test(String(it.sizes || ''))) size = 512;
+      list.push({ url: full, size });
+    }
+    list.sort((a, b) => b.size - a.size);
+    return list.map((x) => x.url);
+  } catch (e) {
+    return [];
+  }
+}
+
+// 直接在整页 HTML 里找内联 data: 图标，不依赖属性解析。
+// 场景：href="data:image/svg+xml,<svg xmlns="http://...">"（双引号套双引号）这类写法，
+// 标签解析会在第一个内层双引号处截断；这里按 SVG 的 </svg> 或 base64 的引号边界取完整 URI。
+function extractInlineDataIcons(html) {
+  const out = [];
+  const re = /data:image\/(?:svg\+xml|x-icon|png|vnd\.microsoft\.icon)/gi;
+  const lower = html.toLowerCase();
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    const start = m.index;
+    const comma = html.indexOf(',', start);
+    if (comma < 0) continue;
+    const meta = html.slice(start + 5, comma).toLowerCase();
+    let end;
+    if (meta.includes('svg') && !meta.includes('base64')) {
+      const close = lower.indexOf('</svg>', comma);
+      if (close < 0) continue;
+      end = close + 6;
+    } else {
+      let i = comma + 1;
+      while (i < html.length && !/[\s"'`<>)]/.test(html[i])) i++;
+      end = i;
+    }
+    const uri = html.slice(start, end);
+    if (uri.length > 40) out.push(uri);
+  }
+  return out;
 }
 
 function resolveUrl(href, baseUrl) {
@@ -448,7 +687,14 @@ function decodeDataUri(uri) {
       for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
       return { mime: mime.toLowerCase(), data: bytes.buffer };
     }
-    const text = decodeURIComponent(payload);
+    // SVG 里常有裸 %（如渐变 offset='50%'），decodeURIComponent 会整体抛错，
+    // 这种情况退回原始 payload，不要整条丢掉
+    let text;
+    try {
+      text = decodeURIComponent(payload);
+    } catch (e) {
+      text = payload;
+    }
     const bytes = new TextEncoder().encode(text);
     return { mime: mime.toLowerCase(), data: bytes.buffer };
   } catch (e) {
@@ -470,6 +716,35 @@ function sniffImageType(buf) {
   const head = new TextDecoder().decode(b.slice(0, 256)).trimStart().toLowerCase();
   if (head.startsWith('<svg') || (head.startsWith('<?xml') && head.includes('<svg'))) return 'image/svg+xml';
   return null;
+}
+
+// 从 ICO 容器里取出最大尺寸的内嵌 PNG 帧。
+// 现代 favicon.ico 基本都是「PNG 封装」，而 Safari / 部分 WebView 的 <img> 不渲染 ICO，
+// 抓到 ICO 直接塞 <img> 会显示空白，看着就像"没取到图标"。
+function largestPngInIco(buf) {
+  try {
+    const b = new Uint8Array(buf);
+    if (b.length < 6) return null;
+    const count = b[4] | (b[5] << 8);
+    if (count === 0 || count > 64) return null;
+    let best = null;
+    for (let i = 0; i < count; i++) {
+      const p = 6 + i * 16;
+      if (p + 16 > b.length) break;
+      const w = b[p] === 0 ? 256 : b[p];
+      const size = b[p + 8] | (b[p + 9] << 8) | (b[p + 10] << 16) | (b[p + 11] << 24);
+      const off = b[p + 12] | (b[p + 13] << 8) | (b[p + 14] << 16) | (b[p + 15] << 24);
+      if (size <= 8 || off + size > b.length) continue;
+      // 只认 PNG 帧（BMP 帧不做转换，交给浏览器原生处理）
+      if (!(b[off] === 0x89 && b[off + 1] === 0x50 && b[off + 2] === 0x4e && b[off + 3] === 0x47)) continue;
+      if (!best || w > best.w) best = { w: w, off: off, size: size };
+    }
+    if (!best) return null;
+    const slice = b.subarray(best.off, best.off + best.size);
+    return slice.buffer.slice(slice.byteOffset, slice.byteOffset + slice.byteLength);
+  } catch (e) {
+    return null;
+  }
 }
 
 function toBase64(buf) {
@@ -498,6 +773,10 @@ function jsonResponse(obj, status) {
     headers: { 'Content-Type': 'application/json' }
   });
 }
+
+/* ========================================================================== *
+ *  六、网页资源抓取
+ * ========================================================================== */
 
 async function fetchWebsite(targetUrl) {
   try {
@@ -710,6 +989,10 @@ async function proxyResource(resourceUrl) {
     return new Response('Failed to fetch resource', { status: 500 });
   }
 }
+
+/* ========================================================================== *
+ *  七、前端页面
+ * ========================================================================== */
 
 function getFrontendHTML(PASSWORD) {
   return `
@@ -1015,13 +1298,15 @@ urlForm.addEventListener('submit', async (e) => {
 
         if (!response.ok) {
             const errorData = await response.json();
-            throw new Error(errorData.error || '获取网站数据失败');
+            const err = new Error(errorData.error || '获取网站数据失败');
+            err.tried = errorData.tried; // 服务端试过的地址与跳过原因
+            throw err;
         }
 
         const data = await response.json();
         displayResults(data);
     } catch (error) {
-        showError(error.message || "获取网站元数据失败");
+        showError(error.message || "获取网站元数据失败", error.tried);
     } finally {
         loadingState.classList.add('hidden');
         submitButton.disabled = false;
@@ -1042,10 +1327,32 @@ function isValidUrl(string) {
     }
 }
 
-function showError(message) {
+function showError(message, tried) {
     errorContainer.classList.remove('hidden');
     errorContainerMessage.textContent = message;
     resultsContainer.classList.add('hidden');
+
+    var oldBox = document.getElementById('errorTried');
+    if (oldBox) oldBox.remove();
+    if (!tried || !tried.length) return;
+
+    var box = document.createElement('details');
+    box.id = 'errorTried';
+    box.style.cssText = 'margin-top:10px;font-size:12px;line-height:1.6;color:#6b7280;max-height:200px;overflow:auto;';
+    var sum = document.createElement('summary');
+    sum.textContent = '诊断信息';
+    sum.style.cssText = 'cursor:pointer;color:#4b5563;';
+    box.appendChild(sum);
+    var ul = document.createElement('ul');
+    ul.style.cssText = 'margin:6px 0 0;padding-left:18px;text-align:left;';
+    tried.forEach(function (item) {
+        var li = document.createElement('li');
+        li.textContent = item;
+        li.style.cssText = 'word-break:break-all;margin-bottom:2px;';
+        ul.appendChild(li);
+    });
+    box.appendChild(ul);
+    errorContainer.appendChild(box);
 }
 
 function displayResults(data) {
