@@ -306,8 +306,8 @@ async function fetchHomePage(domain, tried) {
     res = await fetch(domain, {
       headers: { 'User-Agent': UA, 'Accept': 'text/html,application/xhtml+xml' }
     });
-    // 有些站按 UA 拦数据中心 IP：桌面 Chrome UA 被 403，换手机 UA 就放行
-    if (!res.ok) {
+    // 有些站按 UA 拦数据中心 IP：桌面 Chrome UA 被 403/429，换手机 UA 就放行
+    if (res.status === 403 || res.status === 429) {
       const retry = await fetch(domain, {
         headers: { 'User-Agent': MOBILE_UA, 'Accept': 'text/html,application/xhtml+xml' },
         redirect: 'follow'
@@ -319,16 +319,22 @@ async function fetchHomePage(domain, tried) {
     return info;
   }
 
-  if (!res.ok) {
-    tried.push(domain + ' → 首页 HTTP ' + res.status);
-    return info;
-  }
-
+  // 不能因为状态码不是 2xx 就放弃：登录页、错误页常常也是完整 HTML，图标就写在里面。
+  // 典型情况是站点 / 302 到需要登录的页面并返回 401，此时 <link rel="icon"> 依然存在。
   try {
     info.html = await res.text();
   } catch (e) {
     tried.push(domain + ' → 首页读取失败：' + (e && e.message ? e.message : e));
     return info;
+  }
+  if (!res.ok) {
+    if (/<head|<link|<meta|<html/i.test(info.html)) {
+      tried.push(domain + ' → 首页 HTTP ' + res.status + '，但返回的是 HTML，继续解析图标');
+    } else {
+      tried.push(domain + ' → 首页 HTTP ' + res.status + '，且不是 HTML');
+      info.html = '';
+      return info;
+    }
   }
   info.title = extractTitleFromHTML(info.html);
   info.description = extractDescriptionFromHTML(info.html);
