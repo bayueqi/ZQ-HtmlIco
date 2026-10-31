@@ -288,6 +288,27 @@ function publicIconApis(hostname) {
   ];
 }
 
+// 两级后缀：sdu.edu.cn、bbc.co.uk 这类，主域名本身就有三段，不能再往上退到 edu.cn
+const MULTI_LEVEL_SUFFIX = new Set([
+  'com.cn', 'net.cn', 'org.cn', 'gov.cn', 'edu.cn', 'ac.cn',
+  'com.hk', 'org.hk', 'edu.hk', 'gov.hk', 'com.tw', 'org.tw', 'edu.tw',
+  'com.mo', 'co.uk', 'org.uk', 'ac.uk', 'gov.uk', 'co.jp', 'ne.jp',
+  'or.jp', 'ac.jp', 'go.jp', 'com.au', 'net.au', 'com.br', 'com.sg',
+  'com.my', 'co.kr', 'or.kr', 'com.tr', 'com.ru', 'co.in', 'com.mx'
+]);
+
+// 逐级往上退的上级域名，最近的排前：a.b.example.com → b.example.com、example.com
+function parentHostnames(hostname) {
+  if (!hostname || /^[\d.]+$/.test(hostname)) return []; // IP 没有上级
+  const labels = hostname.split('.');
+  const min = MULTI_LEVEL_SUFFIX.has(labels.slice(-2).join('.')) ? 3 : 2;
+  const out = [];
+  for (let len = labels.length - 1; len >= min; len--) {
+    out.push(labels.slice(-len).join('.'));
+  }
+  return out;
+}
+
 // 文本类响应（软 404、反爬页、旧缓存）：魔数认不出图片就说明不是图标
 function isTextResponse(contentType) {
   return /text\/|application\/(json|xhtml)/.test(contentType || '');
@@ -382,6 +403,15 @@ async function buildCandidates(ctx) {
 
   for (const [re, url] of SITE_ICON_OVERRIDES) {
     if (re.test(hostname)) { list.push(url); break; }
+  }
+
+  // 子站自己一个图标都没有时，主域名上的图标一般就是它想用的
+  // （scenter.sdu.edu.cn 整站 302 到 CAS 登录页，/favicon.ico 是 404；sdu.edu.cn/favicon.ico 有）
+  // 排在公共服务之前：公共服务给的常是通用地球图，不如主域名上的真图标
+  for (const parentHost of parentHostnames(hostname)) {
+    for (const p of ['/favicon.ico', '/favicon.png', '/favicon.svg', '/apple-touch-icon.png']) {
+      list.push('https://' + parentHost + p);
+    }
   }
 
   list.push(...publicIconApis(hostname));
