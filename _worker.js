@@ -701,7 +701,9 @@ function baseHrefOf(html) {
   return attrValue(m[0], 'href');
 }
 
-// sizes="16x16 32x32" / "any" → 最大边长，用来优先挑大图标
+// sizes="16x16 32x32" → 最大边长，用来优先挑大图标。
+// "any" 不折算成具体尺寸：它只说明「尺寸不固定」（常见于 ico 或矢量），
+// 折算成 512 会让一张 ico 排到真正的 180x180 png 前面。
 function maxSizeOf(tag) {
   const s = attrValue(tag, 'sizes');
   if (!s) return 0;
@@ -712,8 +714,22 @@ function maxSizeOf(tag) {
     const v = Math.max(parseInt(m[1], 10) || 0, parseInt(m[2], 10) || 0);
     if (v > best) best = v;
   }
-  if (!best && /any/i.test(s)) best = 512;
   return best;
+}
+
+// 是不是「真图」：png / svg / webp / avif / jpg / gif 这类能直接当位图用的。
+// ico 单独算一类、排后面：它的分辨率取决于内部帧，很多站点的最大帧是把小图放大的，
+// 而同一页面声明的 apple-touch-icon 之类往往才是真正清楚的那张。
+function isRasterIcon(url, rel, type) {
+  const u = String(url).split(/[?#]/)[0].toLowerCase();
+  if (/\.ico$/.test(u)) return false;
+  if (/\.(png|svg|webp|avif|jpe?g|gif)$/.test(u)) return true;
+  const m = /^data:image\/([a-z0-9.+-]+)/i.exec(url);
+  if (m) return !/x-icon|vnd\.microsoft\.icon|bmp/i.test(m[1]);
+  if (/x-icon|vnd\.microsoft\.icon/i.test(type || '')) return false;
+  // 没扩展名（/favicon、/icon?id=1 这种）默认按真图，
+  // 但在本站「常见路径」里已经有 /favicon.ico 兜着
+  return true;
 }
 
 // 解析 HTML 里声明的图标：不依赖属性顺序，覆盖 icon/apple-touch-icon/mask-icon/manifest
@@ -736,8 +752,15 @@ function extractAllFaviconsFromHTML(html, baseUrl) {
     if (/manifest/.test(rel) && !/\bicon\b/.test(rel)) continue;
     if (/\bicon\b/.test(rel) || /apple-touch-icon/.test(rel) || /mask-icon/.test(rel)) {
       const full = href.startsWith('data:') ? href : resolveUrl(href, resolveBase);
-      // mask-icon 是 Safari 固定标签用的单色剪影，当彩色图标用会是一团纯色，排到最后
-      if (full) found.push({ url: full, size: maxSizeOf(tag), mono: /mask-icon/.test(rel) ? 1 : 0 });
+      if (full) {
+        found.push({
+          url: full,
+          size: maxSizeOf(tag),
+          // mask-icon 是 Safari 固定标签用的单色剪影，当彩色图标用会是一团纯色，排到最后
+          mono: /mask-icon/.test(rel) ? 1 : 0,
+          raster: isRasterIcon(full, rel, attrValue(tag, 'type')) ? 1 : 0
+        });
+      }
     }
   }
 
@@ -750,12 +773,14 @@ function extractAllFaviconsFromHTML(html, baseUrl) {
     const content = attrValue(tag, 'content');
     if (content) {
       const full = content.startsWith('data:') ? content : resolveUrl(content, resolveBase);
-      if (full) found.push({ url: full, size: 0, mono: 0 });
+      if (full) found.push({ url: full, size: 0, mono: 0, raster: isRasterIcon(full, '', '') ? 1 : 0 });
     }
   }
 
-  // 声明了尺寸的大图优先：不少站点先写 16x16 再写 512x512，按顺序取会拿到最小的
-  found.sort((a, b) => (a.mono - b.mono) || (b.size - a.size));
+  // 排序：单色剪影最后 → 真图先于 ico → 声明尺寸大的先。
+  // 站点常同时写「ico(any)」和「apple-touch-icon 180x180」，ico 的实际帧往往只有几十像素，
+  // 先试 ico 就会拿到一张放大过的糊图。
+  found.sort((a, b) => (a.mono - b.mono) || (b.raster - a.raster) || (b.size - a.size));
   return found.map((x) => x.url);
 }
 
