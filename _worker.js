@@ -260,29 +260,6 @@ async function handleSimpleFaviconRequest(targetUrl) {
  *      fetchHomePage · buildCandidates · loadCandidate · acceptIcon · findFavicon
  * ========================================================================== */
 
-// Cloudflare 免费版每个请求最多 50 次子请求（每次 fetch 算一次），超出直接抛异常。
-// 候选清单跑满很容易接近这个数，留出余量；预算用尽就停手，别让整条请求变 500。
-const SUBREQUEST_BUDGET = 45;
-
-function makeBudget(limit) {
-  return {
-    limit: limit || SUBREQUEST_BUDGET,
-    used: 0,
-    exhausted: false,
-    fetch(url, opts) {
-      if (this.used >= this.limit) {
-        this.exhausted = true;
-        return Promise.reject(Object.assign(
-          new Error('子请求预算已用完（上限 ' + this.limit + ' 次）'),
-          { budgetExhausted: true }
-        ));
-      }
-      this.used++;
-      return fetch(url, opts);
-    }
-  };
-}
-
 // 兜底路径：绝大多数站点的图标就在这几个位置
 const COMMON_ICON_PATHS = [
   '/favicon.ico', '/favicon.png', '/favicon.svg',
@@ -310,8 +287,11 @@ const SITE_ICON_OVERRIDES = [
 
 // 公共服务兜底：自己拿不到时最后试，能绕过一部分反爬
 function publicIconApis(hostname) {
+  const host = encodeURIComponent(hostname);
   return [
     'https://icons.duckduckgo.com/ip3/' + hostname + '.ico',
+    // faviconV2 给的是按 size 现缩的高清 PNG，比 s2 那套 16px 放大清楚
+    'https://t3.gstatic.com/faviconV2?client=SOCIAL&type=FAVICON&fallback_opts=TYPE,SIZE,URL&url=https://' + host + '&size=256',
     'https://www.google.com/s2/favicons?domain=' + hostname + '&sz=256',
     'https://www.google.com/s2/favicons?domain=' + hostname + '&sz=64'
   ];
@@ -375,31 +355,49 @@ function labelOf(candidate) {
   return candidate.startsWith('data:') ? candidate.slice(0, 32) + '...' : candidate;
 }
 
+// 一整套浏览器导航请求头。机房 IP 常被 WAF 按"缺这几个头"判成爬虫，
+// 只用 UA 不够，Accept-Language / Upgrade-Insecure-Requests 这些也得像浏览器。
+const BROWSER_HEADERS = {
+  'User-Agent': UA,
+  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+  'Accept-Language': 'zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7',
+  'Upgrade-Insecure-Requests': '1'
+};
+
+// 判断拿到的 HTML 到底是真页面，还是 WAF / 反爬 / 登录墙的拦截页。
+// 反爬页有两种长相：带验证关键字，或者干脆是个没有任何外链资源的壳。
+function looksLikeProtectionPage(html) {
+  if (!html) return false;
+  const lower = html.slice(0, 8192).toLowerCase();
+  if (/(captcha|challenge-platform|cf-browser-verification|antibot|hwwaf|acw_sc__v2|just a moment|access denied|安全验证|人机验证|访问验证|请稍候)/.test(lower)) return true;
+  const hasIcon = /rel\s*=\s*["']?[^"'>]*icon/i.test(html);
+  const hasExtResource = /<(script|link)\b[^>]*\b(src|href)\s*=\s*["']?(https?:|\/)/i.test(html);
+  return !hasIcon && !hasExtResource;
+}
+
 // 首页 HTML：顺路拿 title / description；被 UA 拦时换个手机 UA 再来一次
-async function fetchHomePage(domain, tried, budget) {
-  const net = budget || makeBudget();
+async function fetchHomePage(domain, tried) {
   const info = { html: '', title: '', description: '', origin: '' };
   const pageHeaders = { 'User-Agent': UA, 'Accept': 'text/html,application/xhtml+xml' };
   let res = null;
 
   try {
-    res = await net.fetch(domain, { headers: pageHeaders, redirect: 'follow' });
+    res = await fetch(domain, { headers: pageHeaders, redirect: 'follow' });
     // 有些站按 UA 拦数据中心 IP：桌面 Chrome UA 被 403/429，换手机 UA 就放行
     if (res.status === 403 || res.status === 429) {
-      const retry = await net.fetch(domain, {
+      const retry = await fetch(domain, {
         headers: { 'User-Agent': MOBILE_UA, 'Accept': 'text/html,application/xhtml+xml' },
         redirect: 'follow'
       }).catch(() => null);
       if (retry && retry.ok) res = retry;
     }
   } catch (e) {
-    if (e && e.budgetExhausted) { tried.push(e.message); return info; }
     tried.push(domain + ' → 首页请求失败：' + (e && e.message ? e.message : e));
     // 证书过期、只监听 80 端口的老站，https 根本连不上，退回 http 再要一次
     if (!domain.startsWith('https://')) return info;
     const httpBase = domain.replace(/^https:/, 'http:');
     try {
-      res = await net.fetch(httpBase, { headers: pageHeaders, redirect: 'follow' });
+      res = await fetch(httpBase, { headers: pageHeaders, redirect: 'follow' });
       info.origin = httpBase;
     } catch (e2) {
       tried.push(httpBase + ' → http 也连不上');
@@ -415,6 +413,23 @@ async function fetchHomePage(domain, tried, budget) {
     tried.push(domain + ' → 首页读取失败：' + (e && e.message ? e.message : e));
     return info;
   }
+
+  // 403 或一张没有图标声明的拦截页：用完整浏览器头再要一次。
+  // 很多 WAF 就是按请求头像不像浏览器来分流的，这一下能救回一部分站点。
+  if (!res.ok || looksLikeProtectionPage(info.html)) {
+    try {
+      const retry = await fetch(domain, { headers: BROWSER_HEADERS, redirect: 'follow' });
+      if (retry.ok) {
+        const text2 = await retry.text();
+        if (text2 && !looksLikeProtectionPage(text2)) {
+          tried.push(domain + ' → 原请求返回' + (res.ok ? '的疑似拦截页' : ' HTTP ' + res.status) + '，换完整浏览器头重取成功');
+          info.html = text2;
+          res = retry;
+        }
+      }
+    } catch (e) {}
+  }
+
   if (!res.ok) {
     if (/<head|<link|<meta|<html/i.test(info.html)) {
       tried.push(domain + ' → 首页 HTTP ' + res.status + '，但返回的是 HTML，继续解析图标');
@@ -440,7 +455,7 @@ async function buildCandidates(ctx) {
   if (pageHtml) {
     const manifestUrl = extractManifestUrl(pageHtml, domain);
     if (manifestUrl) {
-      const icons = await fetchManifestIcons(manifestUrl, ctx.budget);
+      const icons = await fetchManifestIcons(manifestUrl);
       if (icons.length) {
         tried.push(manifestUrl + ' → manifest 里取到 ' + icons.length + ' 个图标');
         list.push(...icons);
@@ -469,8 +484,10 @@ async function buildCandidates(ctx) {
   // 所以排在本站路径之后，只比父域名和公共服务优先
   if (social && social.length) list.push(...social);
 
-  // 裸域名没图标、图标只在 www 上：站点自己的 www 也补一遍
-  if (!/^www\./i.test(hostname)) {
+  // 裸域名没图标、图标只在 www 上：站点自己的 www 也补一遍。
+  // 只对两级域名（example.com）做这件事：chat.deepseek.com 这种三级域名前面再加 www
+  // 基本不存在对应主机，试了也是 DNS 解析失败。
+  if (!/^www\./i.test(hostname) && hostname.split('.').length <= 2) {
     for (const p of ['/favicon.ico', '/favicon.png', '/favicon.svg', '/apple-touch-icon.png']) {
       list.push('https://www.' + hostname + p);
     }
@@ -503,10 +520,22 @@ async function buildCandidates(ctx) {
   return unique;
 }
 
+// 只用于判断"两次拿到的是不是同一份内容"，不需要密码学强度：
+// 沿内容抽样做 FNV-1a，够快也不会因为大页面烧 CPU
+function quickHash(buf) {
+  const b = new Uint8Array(buf);
+  let h = 0x811c9dc5;
+  const step = Math.max(1, Math.floor(b.length / 512));
+  for (let i = 0; i < b.length; i += step) {
+    h ^= b[i];
+    h = (h * 0x01000193) >>> 0;
+  }
+  return h.toString(16) + '-' + b.length;
+}
+
 // 取单个候选的字节。data URI 直接解；外链带 Referer 应对防盗链；命中旧缓存时加参数重取
 async function loadCandidate(candidate, ctx, tried) {
   const label = labelOf(candidate);
-  const net = ctx.budget || makeBudget();
 
   if (candidate.startsWith('data:')) {
     const parsed = decodeDataUri(candidate);
@@ -521,27 +550,52 @@ async function loadCandidate(candidate, ctx, tried) {
     if (crossOrigin) headers['Referer'] = ctx.domain + '/';
   } catch (e) {}
 
-  let res = await net.fetch(candidate, { headers, redirect: 'follow' });
+  let res = await fetch(candidate, { headers, redirect: 'follow' });
   // 图床普遍做防盗链，但也有反过来只认裸请求的。只在被 401/403/429 挡下时才去掉 Referer 重试：
   // 404 就是没这个文件，重试只是白花一个子请求。
   if (!res.ok && crossOrigin && headers['Referer'] &&
       (res.status === 401 || res.status === 403 || res.status === 429)) {
     delete headers['Referer'];
-    res = await net.fetch(candidate, { headers, redirect: 'follow' });
+    res = await fetch(candidate, { headers, redirect: 'follow' });
   }
   // 图标和首页往往是两套拦截规则，首页放行、图标路径却对数据中心 IP 返 403；
   // 真鉴权的站也可能对 /favicon.ico 返 401。换手机 UA 再试一次。
   if (!res.ok && (res.status === 401 || res.status === 403 || res.status === 429)) {
-    const alt = await net.fetch(candidate, {
+    const alt = await fetch(candidate, {
       headers: { 'User-Agent': MOBILE_UA, 'Accept': 'image/*,*/*;q=0.8' },
       redirect: 'follow'
     }).catch(() => null);
     if (alt && alt.ok) res = alt;
   }
-  if (!res.ok) { tried.push(label + ' → HTTP ' + res.status); return null; }
+  if (!res.ok) {
+    // 本站路径连续被拒，说明整站对机房 IP 关门，后面的固定路径也不会好
+    if (!crossOrigin && ctx.site) {
+      ctx.site.denied++;
+      if (ctx.site.denied >= 3 && /^(401|403|429|503)$/.test(String(res.status))) {
+        ctx.site.locked = '本站路径连续返回 HTTP ' + res.status + '（整站拒绝访问）';
+      }
+    }
+    tried.push(label + ' → HTTP ' + res.status);
+    return null;
+  }
 
   let contentType = (res.headers.get('content-type') || '').toLowerCase();
   let buf = await res.arrayBuffer();
+
+  // 本站任意路径都回同一份 HTML：SPA 的 index.html 回退，或者 WAF 拦截页。
+  // 这种情况继续按固定路径撞下去毫无意义，第二次撞到同一份内容就收手。
+  if (!crossOrigin && ctx.site && isTextResponse(contentType) && !sniffImageType(buf)) {
+    const sig = buf.byteLength + ':' + quickHash(buf);
+    if (sig === ctx.site.htmlSig) {
+      ctx.site.htmlStreak++;
+      if (ctx.site.htmlStreak >= 2 && !ctx.site.locked) {
+        ctx.site.locked = '本站任意路径都返回同一份 HTML（SPA 回退或反爬拦截页）';
+      }
+    } else {
+      ctx.site.htmlSig = sig;
+      ctx.site.htmlStreak = 1;
+    }
+  }
 
   // 站点刚补上图标路由时，CDN 里可能还存着旧的 HTML（.ico/.png/.svg 都在默认可缓存后缀里），
   // 而服务端请求照样读缓存 → 所有图标路径都回 HTML。加一次性参数换掉缓存键再要一次。
@@ -549,7 +603,7 @@ async function loadCandidate(candidate, ctx, tried) {
   if (res.ok && isTextResponse(contentType) && !sniffImageType(buf)) {
     const bustUrl = candidate + (candidate.includes('?') ? '&' : '?') + '_zq=' + Date.now();
     try {
-      const res2 = await net.fetch(bustUrl, { headers, redirect: 'follow' });
+      const res2 = await fetch(bustUrl, { headers, redirect: 'follow' });
       if (res2.ok) {
         const ct2 = (res2.headers.get('content-type') || '').toLowerCase();
         const buf2 = await res2.arrayBuffer();
@@ -606,14 +660,13 @@ function acceptIcon(buf, contentType, tried, label) {
 async function findFavicon(domain, startPath) {
   const hostname = new URL(domain).hostname;
   const out = { url: null, data: null, contentType: null, title: '', description: '', tried: [] };
-  const budget = makeBudget();
 
-  const page = await fetchHomePage(domain, out.tried, budget);
+  const page = await fetchHomePage(domain, out.tried);
   out.title = page.title;
   out.description = page.description;
   // 首页实际是用哪个协议拿到的（http 兜底时和入参不同），后面的候选也跟着它走
   const base = page.origin || domain;
-  const ctx = { domain: base, hostname, startPath, budget };
+  const ctx = { domain: base, hostname, startPath, site: { htmlSig: '', htmlStreak: 0, denied: 0, locked: '', skipped: 0 } };
 
   const declared = page.html ? extractAllFaviconsFromHTML(page.html, base) : [];
   const social = page.html ? extractSocialImages(page.html, base) : [];
@@ -621,13 +674,17 @@ async function findFavicon(domain, startPath) {
     domain: base, hostname, startPath, pageHtml: page.html, declared, social, tried: out.tried
   });
 
+  // 判定这个站"压根读不到图标"后，就不再往它自己的路径上撞：
+  // 一种是被 WAF 拦截，任意路径都回同一份拦截页；一种是整站 403。
+  const baseOrigin = (() => { try { return new URL(base).origin; } catch (e) { return ''; } })();
+  const sameSite = (c) => {
+    try { return new URL(c).origin === baseOrigin; } catch (e) { return false; }
+  };
+
   let index = 0;
   for (const candidate of candidates) {
     index++;
-    if (budget.exhausted) {
-      out.tried.push('子请求预算用完，余下 ' + (candidates.length - index + 1) + ' 个候选未尝试');
-      break;
-    }
+    if (ctx.site.locked && sameSite(candidate)) { ctx.site.skipped++; continue; }
     try {
       const loaded = await loadCandidate(candidate, ctx, out.tried);
       if (!loaded) continue;
@@ -640,12 +697,12 @@ async function findFavicon(domain, startPath) {
       out.contentType = icon.type;
       return out;
     } catch (e) {
-      if (e && e.budgetExhausted) {
-        out.tried.push('子请求预算用完（已用 ' + budget.used + ' 次），停止尝试余下候选');
-        break;
-      }
       out.tried.push(labelOf(candidate) + ' → 异常：' + (e && e.message ? e.message : e));
     }
+  }
+
+  if (ctx.site.skipped) {
+    out.tried.push('本站另有 ' + ctx.site.skipped + ' 个图标路径未尝试：' + ctx.site.locked);
   }
 
   return out;
@@ -822,10 +879,9 @@ function extractManifestUrl(html, baseUrl) {
 }
 
 // 读 manifest 的 icons[]，按尺寸从大到小返回图标地址
-async function fetchManifestIcons(manifestUrl, budget) {
-  const net = budget || makeBudget();
+async function fetchManifestIcons(manifestUrl) {
   try {
-    const res = await net.fetch(manifestUrl, {
+    const res = await fetch(manifestUrl, {
       headers: { 'User-Agent': UA, 'Accept': 'application/manifest+json,application/json' }
     });
     if (!res.ok) return [];
