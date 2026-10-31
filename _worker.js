@@ -244,7 +244,11 @@ async function handleSimpleFaviconRequest(targetUrl) {
     const { found } = await resolveFavicon(normalizeTargetUrl(targetUrl));
     if (!found.url) return jsonResponse({ error: '无法获取网站图标' }, 404);
     return new Response(found.data, {
-      headers: { 'Content-Type': found.contentType || 'image/x-icon' }
+      headers: {
+        'Content-Type': found.contentType || 'image/x-icon',
+        // 同一个域名的图标反复请求是常态（首屏一堆快捷方式），让浏览器自己缓存一天
+        'Cache-Control': 'public, max-age=86400'
+      }
     });
   } catch (error) {
     return jsonResponse({ error: error.message }, 500);
@@ -255,6 +259,29 @@ async function handleSimpleFaviconRequest(targetUrl) {
  *  四、图标抓取
  *      fetchHomePage · buildCandidates · loadCandidate · acceptIcon · findFavicon
  * ========================================================================== */
+
+// Cloudflare 免费版每个请求最多 50 次子请求（每次 fetch 算一次），超出直接抛异常。
+// 候选清单跑满很容易接近这个数，留出余量；预算用尽就停手，别让整条请求变 500。
+const SUBREQUEST_BUDGET = 45;
+
+function makeBudget(limit) {
+  return {
+    limit: limit || SUBREQUEST_BUDGET,
+    used: 0,
+    exhausted: false,
+    fetch(url, opts) {
+      if (this.used >= this.limit) {
+        this.exhausted = true;
+        return Promise.reject(Object.assign(
+          new Error('子请求预算已用完（上限 ' + this.limit + ' 次）'),
+          { budgetExhausted: true }
+        ));
+      }
+      this.used++;
+      return fetch(url, opts);
+    }
+  };
+}
 
 // 兜底路径：绝大多数站点的图标就在这几个位置
 const COMMON_ICON_PATHS = [
@@ -271,12 +298,14 @@ const COMMON_ICON_PATHS = [
 
 // 少数站点图标不在自己域名下，只能用固定地址
 const SITE_ICON_OVERRIDES = [
-  [/github\.com$/, 'https://github.githubassets.com/favicon.ico'],
-  [/google\./, 'https://www.google.com/favicon.ico'],
-  [/(twitter|x)\.com$/, 'https://abs.twimg.com/favicons/twitter.ico'],
-  [/facebook\.com$/, 'https://www.facebook.com/favicon.ico'],
-  [/instagram\.com$/, 'https://www.instagram.com/favicon.ico'],
-  [/youtube\.com$/, 'https://www.youtube.com/s/desktop/favicon.ico']
+  [/(^|\.)github\.com$/, 'https://github.githubassets.com/favicon.ico'],
+  // 只匹配真正的 google 域（google.com / google.co.jp / www.google.com.hk），
+  // 别把 google.evil.com 这种也拦下来
+  [/(^|\.)google\.[a-z]{2,3}(\.[a-z]{2})?$/, 'https://www.google.com/favicon.ico'],
+  [/(^|\.)(twitter|x)\.com$/, 'https://abs.twimg.com/favicons/twitter.ico'],
+  [/(^|\.)facebook\.com$/, 'https://www.facebook.com/favicon.ico'],
+  [/(^|\.)instagram\.com$/, 'https://www.instagram.com/favicon.ico'],
+  [/(^|\.)youtube\.com$/, 'https://www.youtube.com/s/desktop/favicon.ico']
 ];
 
 // 公共服务兜底：自己拿不到时最后试，能绕过一部分反爬
@@ -291,10 +320,37 @@ function publicIconApis(hostname) {
 // 两级后缀：sdu.edu.cn、bbc.co.uk 这类，主域名本身就有三段，不能再往上退到 edu.cn
 const MULTI_LEVEL_SUFFIX = new Set([
   'com.cn', 'net.cn', 'org.cn', 'gov.cn', 'edu.cn', 'ac.cn',
-  'com.hk', 'org.hk', 'edu.hk', 'gov.hk', 'com.tw', 'org.tw', 'edu.tw',
-  'com.mo', 'co.uk', 'org.uk', 'ac.uk', 'gov.uk', 'co.jp', 'ne.jp',
-  'or.jp', 'ac.jp', 'go.jp', 'com.au', 'net.au', 'com.br', 'com.sg',
-  'com.my', 'co.kr', 'or.kr', 'com.tr', 'com.ru', 'co.in', 'com.mx'
+  'com.hk', 'org.hk', 'edu.hk', 'gov.hk', 'net.hk', 'idv.hk',
+  'com.tw', 'org.tw', 'edu.tw', 'gov.tw', 'net.tw', 'idv.tw',
+  'com.mo', 'org.mo', 'edu.mo', 'gov.mo', 'net.mo',
+  'co.uk', 'org.uk', 'ac.uk', 'gov.uk', 'me.uk', 'ltd.uk', 'plc.uk', 'net.uk', 'nhs.uk', 'police.uk',
+  'co.jp', 'ne.jp', 'or.jp', 'ac.jp', 'go.jp', 'ed.jp', 'gr.jp', 'lg.jp',
+  'com.au', 'net.au', 'org.au', 'edu.au', 'gov.au', 'asn.au', 'id.au',
+  'co.nz', 'net.nz', 'org.nz', 'ac.nz', 'govt.nz', 'school.nz', 'geek.nz', 'kiwi.nz',
+  'com.ua', 'net.ua', 'org.ua', 'edu.ua', 'gov.ua', 'in.ua', 'kiev.ua',
+  'com.pl', 'net.pl', 'org.pl', 'edu.pl', 'gov.pl', 'waw.pl',
+  'co.za', 'org.za', 'net.za', 'gov.za', 'ac.za', 'web.za',
+  'com.br', 'net.br', 'org.br', 'gov.br', 'edu.br', 'art.br', 'blog.br',
+  'com.sg', 'net.sg', 'org.sg', 'edu.sg', 'gov.sg', 'per.sg',
+  'com.my', 'net.my', 'org.my', 'edu.my', 'gov.my', 'name.my',
+  'co.kr', 'or.kr', 'ne.kr', 're.kr', 'pe.kr', 'go.kr', 'ac.kr', 'hs.kr', 'ms.kr', 'es.kr', 'sc.kr', 'kg.kr',
+  'com.tr', 'net.tr', 'org.tr', 'edu.tr', 'gov.tr', 'gen.tr', 'web.tr',
+  'com.ru', 'net.ru', 'org.ru', 'msk.ru', 'spb.ru',
+  'co.in', 'net.in', 'org.in', 'firm.in', 'gen.in', 'ind.in', 'ac.in', 'edu.in', 'gov.in', 'res.in',
+  'com.mx', 'net.mx', 'org.mx', 'edu.mx', 'gob.mx',
+  'co.il', 'org.il', 'net.il', 'ac.il', 'gov.il', 'muni.il',
+  'com.ar', 'net.ar', 'org.ar', 'edu.ar', 'gob.ar',
+  'com.co', 'net.co', 'org.co', 'edu.co', 'gov.co',
+  'com.pe', 'net.pe', 'org.pe', 'edu.pe', 'gob.pe',
+  'com.ve', 'com.ec', 'com.uy', 'com.py', 'com.bo', 'com.do', 'com.gt', 'com.sv', 'com.hn', 'com.ni', 'com.pa',
+  'co.id', 'or.id', 'ac.id', 'go.id', 'web.id', 'my.id', 'sch.id',
+  'com.ph', 'net.ph', 'org.ph', 'edu.ph', 'gov.ph',
+  'com.vn', 'net.vn', 'org.vn', 'edu.vn', 'gov.vn',
+  'co.th', 'or.th', 'ac.th', 'go.th', 'in.th',
+  'com.pk', 'net.pk', 'org.pk', 'edu.pk', 'gov.pk',
+  'com.bd', 'com.np', 'com.lk', 'com.mm', 'com.kh',
+  'co.ke', 'or.ke', 'ac.ke', 'go.ke', 'com.ng', 'org.ng', 'com.gh', 'com.eg', 'com.sa', 'com.ae', 'co.ae', 'ac.ae', 'gov.ae',
+  'com.qa', 'com.kw', 'com.bh', 'com.om', 'com.jo', 'com.lb', 'com.iq', 'com.ir'
 ]);
 
 // 逐级往上退的上级域名，最近的排前：a.b.example.com → b.example.com、example.com
@@ -320,28 +376,30 @@ function labelOf(candidate) {
 }
 
 // 首页 HTML：顺路拿 title / description；被 UA 拦时换个手机 UA 再来一次
-async function fetchHomePage(domain, tried) {
+async function fetchHomePage(domain, tried, budget) {
+  const net = budget || makeBudget();
   const info = { html: '', title: '', description: '', origin: '' };
   const pageHeaders = { 'User-Agent': UA, 'Accept': 'text/html,application/xhtml+xml' };
   let res = null;
 
   try {
-    res = await fetch(domain, { headers: pageHeaders, redirect: 'follow' });
+    res = await net.fetch(domain, { headers: pageHeaders, redirect: 'follow' });
     // 有些站按 UA 拦数据中心 IP：桌面 Chrome UA 被 403/429，换手机 UA 就放行
     if (res.status === 403 || res.status === 429) {
-      const retry = await fetch(domain, {
+      const retry = await net.fetch(domain, {
         headers: { 'User-Agent': MOBILE_UA, 'Accept': 'text/html,application/xhtml+xml' },
         redirect: 'follow'
       }).catch(() => null);
       if (retry && retry.ok) res = retry;
     }
   } catch (e) {
+    if (e && e.budgetExhausted) { tried.push(e.message); return info; }
     tried.push(domain + ' → 首页请求失败：' + (e && e.message ? e.message : e));
     // 证书过期、只监听 80 端口的老站，https 根本连不上，退回 http 再要一次
     if (!domain.startsWith('https://')) return info;
     const httpBase = domain.replace(/^https:/, 'http:');
     try {
-      res = await fetch(httpBase, { headers: pageHeaders, redirect: 'follow' });
+      res = await net.fetch(httpBase, { headers: pageHeaders, redirect: 'follow' });
       info.origin = httpBase;
     } catch (e2) {
       tried.push(httpBase + ' → http 也连不上');
@@ -371,16 +429,18 @@ async function fetchHomePage(domain, tried) {
   return info;
 }
 
-// 候选清单：页面声明 → manifest → 常见路径 → 子目录 → 内联 data: → 站点特判 → 公共服务
+// 候选清单：页面声明 → manifest → 常见路径 → 子目录 → 内联 data: → 站点特判
+//            → 社交分享图 → 本站 www → 主域名 → 公共服务
 async function buildCandidates(ctx) {
-  const { domain, hostname, startPath, pageHtml, declared, tried } = ctx;
+  const { domain, hostname, startPath, pageHtml, declared, social, tried } = ctx;
   const list = declared.slice();
 
-  // 页面没写图标、只挂了 manifest 的站点：去 manifest 里拿 icons[]
-  if (!declared.length && pageHtml) {
+  // manifest 只要挂了就读。原来只在「页面一个 icon 都没声明」时才读，
+  // 于是「声明了一个 404 的图标、好图标在 manifest 里」这种站必然失败。
+  if (pageHtml) {
     const manifestUrl = extractManifestUrl(pageHtml, domain);
     if (manifestUrl) {
-      const icons = await fetchManifestIcons(manifestUrl);
+      const icons = await fetchManifestIcons(manifestUrl, ctx.budget);
       if (icons.length) {
         tried.push(manifestUrl + ' → manifest 里取到 ' + icons.length + ' 个图标');
         list.push(...icons);
@@ -405,19 +465,32 @@ async function buildCandidates(ctx) {
     if (re.test(hostname)) { list.push(url); break; }
   }
 
+  // og:image / twitter:image 多半是横幅大图，缩到 16px 什么都看不清，
+  // 所以排在本站路径之后，只比父域名和公共服务优先
+  if (social && social.length) list.push(...social);
+
+  // 裸域名没图标、图标只在 www 上：站点自己的 www 也补一遍
+  if (!/^www\./i.test(hostname)) {
+    for (const p of ['/favicon.ico', '/favicon.png', '/favicon.svg', '/apple-touch-icon.png']) {
+      list.push('https://www.' + hostname + p);
+    }
+  }
+
   // 子站自己一个图标都没有时，主域名上的图标一般就是它想用的
   // （scenter.sdu.edu.cn 整站 302 到 CAS 登录页，/favicon.ico 是 404；sdu.edu.cn/favicon.ico 有）
   // 先试 www：正式站点的图标多挂在 www 上，裸域名常是老站/CMS 遗留的
   // （sdu.edu.cn 是蓝底白 C，www.sdu.edu.cn 才是红色校徽），www 没结果再退裸域名
   // 排在公共服务之前：公共服务给的常是通用地球图，不如主域名上的真图标
-  for (const parentHost of parentHostnames(hostname)) {
+  // 只试最近两级，且第二级只试 /favicon.ico：层级越往上越不可能是它的图标，别把子请求预算耗光
+  parentHostnames(hostname).slice(0, 2).forEach((parentHost, level) => {
     const hosts = parentHost.startsWith('www.') ? [parentHost] : ['www.' + parentHost, parentHost];
+    const paths = level === 0
+      ? ['/favicon.ico', '/favicon.png', '/favicon.svg', '/apple-touch-icon.png']
+      : ['/favicon.ico'];
     for (const h of hosts) {
-      for (const p of ['/favicon.ico', '/favicon.png', '/favicon.svg', '/apple-touch-icon.png']) {
-        list.push('https://' + h + p);
-      }
+      for (const p of paths) list.push('https://' + h + p);
     }
-  }
+  });
 
   list.push(...publicIconApis(hostname));
 
@@ -433,6 +506,7 @@ async function buildCandidates(ctx) {
 // 取单个候选的字节。data URI 直接解；外链带 Referer 应对防盗链；命中旧缓存时加参数重取
 async function loadCandidate(candidate, ctx, tried) {
   const label = labelOf(candidate);
+  const net = ctx.budget || makeBudget();
 
   if (candidate.startsWith('data:')) {
     const parsed = decodeDataUri(candidate);
@@ -447,16 +521,18 @@ async function loadCandidate(candidate, ctx, tried) {
     if (crossOrigin) headers['Referer'] = ctx.domain + '/';
   } catch (e) {}
 
-  let res = await fetch(candidate, { headers, redirect: 'follow' });
-  // 图床普遍做防盗链，但也有反过来只认裸请求的，去掉 Referer 再试一次
-  if (!res.ok && crossOrigin && headers['Referer']) {
+  let res = await net.fetch(candidate, { headers, redirect: 'follow' });
+  // 图床普遍做防盗链，但也有反过来只认裸请求的。只在被 401/403/429 挡下时才去掉 Referer 重试：
+  // 404 就是没这个文件，重试只是白花一个子请求。
+  if (!res.ok && crossOrigin && headers['Referer'] &&
+      (res.status === 401 || res.status === 403 || res.status === 429)) {
     delete headers['Referer'];
-    res = await fetch(candidate, { headers, redirect: 'follow' });
+    res = await net.fetch(candidate, { headers, redirect: 'follow' });
   }
   // 图标和首页往往是两套拦截规则，首页放行、图标路径却对数据中心 IP 返 403；
   // 真鉴权的站也可能对 /favicon.ico 返 401。换手机 UA 再试一次。
   if (!res.ok && (res.status === 401 || res.status === 403 || res.status === 429)) {
-    const alt = await fetch(candidate, {
+    const alt = await net.fetch(candidate, {
       headers: { 'User-Agent': MOBILE_UA, 'Accept': 'image/*,*/*;q=0.8' },
       redirect: 'follow'
     }).catch(() => null);
@@ -469,10 +545,11 @@ async function loadCandidate(candidate, ctx, tried) {
 
   // 站点刚补上图标路由时，CDN 里可能还存着旧的 HTML（.ico/.png/.svg 都在默认可缓存后缀里），
   // 而服务端请求照样读缓存 → 所有图标路径都回 HTML。加一次性参数换掉缓存键再要一次。
-  if (isTextResponse(contentType) && !sniffImageType(buf)) {
+  // 只对 2xx 做：真 404 说明服务端就没这个文件，重取一次纯属多花一个子请求。
+  if (res.ok && isTextResponse(contentType) && !sniffImageType(buf)) {
     const bustUrl = candidate + (candidate.includes('?') ? '&' : '?') + '_zq=' + Date.now();
     try {
-      const res2 = await fetch(bustUrl, { headers, redirect: 'follow' });
+      const res2 = await net.fetch(bustUrl, { headers, redirect: 'follow' });
       if (res2.ok) {
         const ct2 = (res2.headers.get('content-type') || '').toLowerCase();
         const buf2 = await res2.arrayBuffer();
@@ -529,20 +606,28 @@ function acceptIcon(buf, contentType, tried, label) {
 async function findFavicon(domain, startPath) {
   const hostname = new URL(domain).hostname;
   const out = { url: null, data: null, contentType: null, title: '', description: '', tried: [] };
+  const budget = makeBudget();
 
-  const page = await fetchHomePage(domain, out.tried);
+  const page = await fetchHomePage(domain, out.tried, budget);
   out.title = page.title;
   out.description = page.description;
   // 首页实际是用哪个协议拿到的（http 兜底时和入参不同），后面的候选也跟着它走
   const base = page.origin || domain;
-  const ctx = { domain: base, hostname, startPath };
+  const ctx = { domain: base, hostname, startPath, budget };
 
   const declared = page.html ? extractAllFaviconsFromHTML(page.html, base) : [];
+  const social = page.html ? extractSocialImages(page.html, base) : [];
   const candidates = await buildCandidates({
-    domain: base, hostname, startPath, pageHtml: page.html, declared, tried: out.tried
+    domain: base, hostname, startPath, pageHtml: page.html, declared, social, tried: out.tried
   });
 
+  let index = 0;
   for (const candidate of candidates) {
+    index++;
+    if (budget.exhausted) {
+      out.tried.push('子请求预算用完，余下 ' + (candidates.length - index + 1) + ' 个候选未尝试');
+      break;
+    }
     try {
       const loaded = await loadCandidate(candidate, ctx, out.tried);
       if (!loaded) continue;
@@ -555,6 +640,10 @@ async function findFavicon(domain, startPath) {
       out.contentType = icon.type;
       return out;
     } catch (e) {
+      if (e && e.budgetExhausted) {
+        out.tried.push('子请求预算用完（已用 ' + budget.used + ' 次），停止尝试余下候选');
+        break;
+      }
       out.tried.push(labelOf(candidate) + ' → 异常：' + (e && e.message ? e.message : e));
     }
   }
@@ -647,26 +736,48 @@ function extractAllFaviconsFromHTML(html, baseUrl) {
     if (/manifest/.test(rel) && !/\bicon\b/.test(rel)) continue;
     if (/\bicon\b/.test(rel) || /apple-touch-icon/.test(rel) || /mask-icon/.test(rel)) {
       const full = href.startsWith('data:') ? href : resolveUrl(href, resolveBase);
-      if (full) found.push({ url: full, size: maxSizeOf(tag) });
+      // mask-icon 是 Safari 固定标签用的单色剪影，当彩色图标用会是一团纯色，排到最后
+      if (full) found.push({ url: full, size: maxSizeOf(tag), mono: /mask-icon/.test(rel) ? 1 : 0 });
     }
   }
 
-  // og:image / twitter:image / msapplication-TileImage 兜底
+  // msapplication-TileImage 是 Windows 磁贴图标，算真图标
   const metaRegex = /<meta\b(?:"[^"]*"|'[^']*'|[^>"'])*>/gi;
   while ((m = metaRegex.exec(html)) !== null) {
     const tag = m[0];
     const prop = attrValue(tag, 'property|name').toLowerCase();
-    if (prop !== 'og:image' && prop !== 'twitter:image' && prop !== 'msapplication-tileimage') continue;
+    if (prop !== 'msapplication-tileimage') continue;
     const content = attrValue(tag, 'content');
     if (content) {
       const full = content.startsWith('data:') ? content : resolveUrl(content, resolveBase);
-      if (full) found.push({ url: full, size: 0 });
+      if (full) found.push({ url: full, size: 0, mono: 0 });
     }
   }
 
   // 声明了尺寸的大图优先：不少站点先写 16x16 再写 512x512，按顺序取会拿到最小的
-  found.sort((a, b) => b.size - a.size);
+  found.sort((a, b) => (a.mono - b.mono) || (b.size - a.size));
   return found.map((x) => x.url);
+}
+
+// 社交分享图：og:image / twitter:image 通常是横幅大图，不是图标，
+// 单独拿出来排在固定路径之后，只当最后的救命稻草
+function extractSocialImages(html, baseUrl) {
+  html = html.replace(/<!--[\s\S]*?-->/g, '');
+  const base = baseHrefOf(html);
+  const resolveBase = base ? (resolveUrl(base, baseUrl) || baseUrl) : baseUrl;
+  const out = [];
+  const metaRegex = /<meta\b(?:"[^"]*"|'[^']*'|[^>"'])*>/gi;
+  let m;
+  while ((m = metaRegex.exec(html)) !== null) {
+    const tag = m[0];
+    const prop = attrValue(tag, 'property|name').toLowerCase();
+    if (prop !== 'og:image' && prop !== 'twitter:image') continue;
+    const content = attrValue(tag, 'content');
+    if (!content) continue;
+    const full = content.startsWith('data:') ? content : resolveUrl(content, resolveBase);
+    if (full && out.indexOf(full) < 0) out.push(full);
+  }
+  return out;
 }
 
 // <link rel="manifest">：很多站点只在 manifest 里列图标
@@ -686,9 +797,10 @@ function extractManifestUrl(html, baseUrl) {
 }
 
 // 读 manifest 的 icons[]，按尺寸从大到小返回图标地址
-async function fetchManifestIcons(manifestUrl) {
+async function fetchManifestIcons(manifestUrl, budget) {
+  const net = budget || makeBudget();
   try {
-    const res = await fetch(manifestUrl, {
+    const res = await net.fetch(manifestUrl, {
       headers: { 'User-Agent': UA, 'Accept': 'application/manifest+json,application/json' }
     });
     if (!res.ok) return [];
@@ -797,6 +909,11 @@ function sniffImageType(buf) {
   if (b[0] === 0x52 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x46 &&
       b[8] === 0x57 && b[9] === 0x45 && b[10] === 0x42 && b[11] === 0x50) return 'image/webp';
   if (b[0] === 0x42 && b[1] === 0x4d) return 'image/bmp';
+  // AVIF：ISO-BMFF 容器，ftyp box 的品牌名是 avif / avis
+  if (b.length >= 12 && b[4] === 0x66 && b[5] === 0x74 && b[6] === 0x79 && b[7] === 0x70) {
+    const brand = String.fromCharCode(b[8], b[9], b[10], b[11]).toLowerCase();
+    if (brand === 'avif' || brand === 'avis') return 'image/avif';
+  }
   // 去掉 BOM 和开头的注释：有些 SVG 前面挂着 <!-- Generator: ... -->，不剥掉会认不出来
   const head = new TextDecoder().decode(b.slice(0, 512))
     .replace(/^\uFEFF/, '')
