@@ -407,10 +407,15 @@ async function buildCandidates(ctx) {
 
   // 子站自己一个图标都没有时，主域名上的图标一般就是它想用的
   // （scenter.sdu.edu.cn 整站 302 到 CAS 登录页，/favicon.ico 是 404；sdu.edu.cn/favicon.ico 有）
+  // 先试 www：正式站点的图标多挂在 www 上，裸域名常是老站/CMS 遗留的
+  // （sdu.edu.cn 是蓝底白 C，www.sdu.edu.cn 才是红色校徽），www 没结果再退裸域名
   // 排在公共服务之前：公共服务给的常是通用地球图，不如主域名上的真图标
   for (const parentHost of parentHostnames(hostname)) {
-    for (const p of ['/favicon.ico', '/favicon.png', '/favicon.svg', '/apple-touch-icon.png']) {
-      list.push('https://' + parentHost + p);
+    const hosts = parentHost.startsWith('www.') ? [parentHost] : ['www.' + parentHost, parentHost];
+    for (const h of hosts) {
+      for (const p of ['/favicon.ico', '/favicon.png', '/favicon.svg', '/apple-touch-icon.png']) {
+        list.push('https://' + h + p);
+      }
     }
   }
 
