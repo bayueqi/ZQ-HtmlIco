@@ -912,7 +912,7 @@ async function fetchManifestIcons(manifestUrl) {
 function extractInlineDataIcons(html) {
   const out = [];
   html = html.replace(/<!--[\s\S]*?-->/g, '');
-  const re = /data:image\/(?:svg\+xml|x-icon|png|vnd\.microsoft\.icon)/gi;
+  const re = /data:image\/(?:svg\+xml|png|webp|jpe?g|gif|avif|bmp|x-icon|vnd\.microsoft\.icon)/gi;
   const lower = html.toLowerCase();
   let m;
   while ((m = re.exec(html)) !== null) {
